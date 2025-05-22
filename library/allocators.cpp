@@ -16,6 +16,8 @@
  */
 
 #include <cuda.h>
+#include <chrono>
+#include <thread>
 #include "error.h"
 #include "kernels.cuh"
 #include "nvloom.h"
@@ -61,7 +63,7 @@ HostMemoryAllocation::~HostMemoryAllocation() {
     }
 }
 
-static int roundUp(size_t number, size_t multiple) {
+static size_t roundUp(size_t number, size_t multiple) {
     return ((number + multiple - 1) / multiple) * multiple;
 }
 
@@ -142,8 +144,7 @@ bool MultinodeMemoryAllocationEGM::filter() {
     return pi != 0;
 };
 
-
-MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank) {
+CUresult MultinodeMemoryAllocationMulticast::tryAllocation(size_t _allocationSize, int _MPIrank) {
     handleType = CU_MEM_HANDLE_TYPE_FABRIC;
     multicastProp.numDevices = MPIWrapper::getWorldSize();
     multicastProp.handleTypes = handleType;
@@ -163,7 +164,6 @@ MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _a
     MPI_Bcast(&fh, sizeof(fh), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
 
     if (_MPIrank != MPIWrapper::getWorldRank()) {
-
         CU_ASSERT(cuMemImportFromShareableHandle(&multicastHandle, (void *)&fh, handleType));
     }
 
@@ -179,7 +179,28 @@ MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _a
     prop.location.id = NvLoom::getLocalDevice();
     prop.requestedHandleTypes = handleType;
     CU_ASSERT(cuMemCreate(&handle, roundedUpAllocationSize, &prop, 0 /*flags*/));
-    CU_ASSERT(cuMulticastBindMem(multicastHandle, 0, handle, 0, roundedUpAllocationSize, 0));
+
+    auto error = cuMulticastBindMem(multicastHandle, 0, handle, 0, roundedUpAllocationSize, 0);
+    uint8_t earlyReturn = 0;
+    if (error == CUDA_ERROR_SYSTEM_NOT_READY) {
+        earlyReturn = 1;
+    }
+
+    uint8_t reducedEarlyReturn = 0;
+    MPI_Allreduce(&earlyReturn, &reducedEarlyReturn, 1, MPI_BYTE, MPI_MAX, MPI_COMM_WORLD);
+
+    if (reducedEarlyReturn > 0) {
+        if (error != CUDA_ERROR_SYSTEM_NOT_READY) {
+            CU_ASSERT(cuMulticastUnbind(multicastHandle, NvLoom::getLocalCuDevice(), 0, roundedUpAllocationSize));
+        }
+
+        CU_ASSERT(cuMemRelease(handle));
+        CU_ASSERT(cuMemRelease(multicastHandle));
+
+        return CUDA_ERROR_SYSTEM_NOT_READY;
+    }
+
+    CU_ASSERT(error);
 
     // Map the memory - unicast
     CU_ASSERT(cuMemAddressReserve((CUdeviceptr *) &unicastMappingPtr, roundedUpAllocationSize, 0, 0 /*baseVA*/, 0 /*flags*/));
@@ -202,7 +223,28 @@ MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _a
 
     // Make sure that everyone is done with mapping the fabric allocation
     MPI_Barrier(MPI_COMM_WORLD);
+    return CUDA_SUCCESS;
+}
 
+
+MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank) {
+    auto error = tryAllocation(_allocationSize, _MPIrank);
+
+    if (error == CUDA_ERROR_SYSTEM_NOT_READY) {
+        int totalTimeWaited = 0;
+
+        while ((error == CUDA_ERROR_SYSTEM_NOT_READY) && (totalTimeWaited < 60)) {
+            int retryTimeout = 15;
+            totalTimeWaited += retryTimeout;
+
+            if (MPIWrapper::getWorldRank() == 0) {
+                std::cerr << "sleeping for " << retryTimeout << " seconds before retrying allocating multicast memory, total wait: " << totalTimeWaited << std::endl;
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(retryTimeout));
+            error = tryAllocation(_allocationSize, _MPIrank);
+        }
+    }
 }
 
 MultinodeMemoryAllocationMulticast::~MultinodeMemoryAllocationMulticast() {
@@ -235,7 +277,7 @@ template<class T>
 AllocationPool<T>::AllocationPool(size_t _allocationSize, int _MPIrank) {
     allocationSize = _allocationSize;
     MPIrank = _MPIrank;
-    
+
     auto key = std::make_pair(allocationSize, MPIrank);
     auto it = pool.find(key);
     if (it == pool.end()) {

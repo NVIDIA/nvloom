@@ -24,7 +24,13 @@
 #include <iostream>
 #include <memory>
 
+#define NVLOOM_VERSION "1.1.0"
+#ifndef GIT_COMMIT
+#define GIT_COMMIT "unknown"
+#endif
+
 bool richOutput = false;
+int gpuToRackSamples = 5;
 
 int run_program(int argc, char **argv) {
     boost::program_options::options_description opts("nvloom CLI");
@@ -43,7 +49,8 @@ int run_program(int argc, char **argv) {
         ("suite,s", boost::program_options::value<std::vector<std::string>>(&suitesToRun)->multitoken(), suitesOptionDescription.c_str())
         ("listTestcases,l", boost::program_options::bool_switch(&listTestcases)->default_value(listTestcases), "List testcases")
         ("richOutput,r", boost::program_options::bool_switch(&richOutput)->default_value(richOutput), "Rich output")
-        ("allocatorStrategy,a", boost::program_options::value<std::string>(&allocatorStrategyString)->default_value("reuse"), "Allocator strategy: choose between unique and reuse");
+        ("allocatorStrategy,a", boost::program_options::value<std::string>(&allocatorStrategyString)->default_value("reuse"), "Allocator strategy: choose between unique and reuse")
+        ("gpuToRackSamples", boost::program_options::value<int>(&gpuToRackSamples)->default_value(gpuToRackSamples), "Number of per-rack samples to use in gpu_to_rack testcases")
         ;
 
     boost::program_options::variables_map vm;
@@ -62,6 +69,9 @@ int run_program(int argc, char **argv) {
         return 0;
     }
 
+    OUTPUT << "nvloom_cli " << NVLOOM_VERSION << std::endl;
+    OUTPUT << "git commit: " << GIT_COMMIT << std::endl;
+
     AllocatorStrategy allocatorStrategy;
     if (allocatorStrategyString == "reuse"){
         allocatorStrategy = ALLOCATOR_STRATEGY_REUSE;
@@ -77,11 +87,13 @@ int run_program(int argc, char **argv) {
 
     size_t bufferSizeInB = (size_t) bufferSizeInMiB * 1024 * 1024;
 
+    OUTPUT << "Buffer size: " << bufferSizeInMiB << " MiB" << std::endl;
+
     auto [testcases, suites] = buildTestcases(allocatorStrategy);
 
     if (listTestcases) {
         OUTPUT << "Available testcases: " << std::endl;
-        for (auto const& [testcaseName, testcaseFunction] : testcases) { 
+        for (auto const& [testcaseName, testcaseFunction] : testcases) {
             OUTPUT << testcaseName << std::endl;
         }
         return 0;
@@ -96,13 +108,13 @@ int run_program(int argc, char **argv) {
     for (auto suite: suitesToRun) {
         if (suites.count(suite) == 0) {
             std::cerr << "No such suite as \"" << suite << "\"\n";
-            return 1; 
+            return 1;
         }
         for (auto testcase: suites[suite]) {
             testcasesToRunSet.insert(testcase);
         }
     }
-    
+
     for (auto testcase: testcasesToRun) {
         if (testcases.count(testcase) == 0) {
             std::cerr << "No such testcase as \"" << testcase << "\"\n";
@@ -123,7 +135,7 @@ int run_program(int argc, char **argv) {
         testcases[testcase]->filterRun(bufferSizeInB);
         clearAllocationPools();
         auto endTime = std::chrono::high_resolution_clock::now();
-        OUTPUT << "ExecutionTime[s] " << testcase << " " << std::chrono::duration<double>(endTime - startTime).count() << std::endl;
+        OUTPUT << "ExecutionTime " << testcase << " " << std::chrono::duration<double>(endTime - startTime).count() << " s" << std::endl;
         OUTPUT << "Done " << testcase << std::endl;
         OUTPUT << std::endl;
     }

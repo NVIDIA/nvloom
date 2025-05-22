@@ -22,6 +22,7 @@
 #include <map>
 
 extern bool richOutput;
+extern int gpuToRackSamples;
 
 enum AllocatorStrategy {
     ALLOCATOR_STRATEGY_UNIQUE = 0,

@@ -57,8 +57,8 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     for (int i = 0; i < filteredCopies.size(); i++) {
         CU_ASSERT(cuStreamCreate(&filteredStreams[i], CU_STREAM_NON_BLOCKING));
 
-        CU_ASSERT(cuEventCreate(&filteredStartEvents[i], CU_EVENT_DEFAULT));    
-        CU_ASSERT(cuEventCreate(&filteredEndEvents[i], CU_EVENT_DEFAULT));    
+        CU_ASSERT(cuEventCreate(&filteredStartEvents[i], CU_EVENT_DEFAULT));
+        CU_ASSERT(cuEventCreate(&filteredEndEvents[i], CU_EVENT_DEFAULT));
     }
 
     // fill buffers
@@ -80,8 +80,8 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
 
     // block streams
     for (int i = 0; i < filteredCopies.size(); i++) {
-        CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost.ptr : nullptr, 
-                                        (volatile int *) blockingVarDevice.ptr, 
+        CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost.ptr : nullptr,
+                                        (volatile int *) blockingVarDevice.ptr,
                                         filteredStreams[i]));
     }
 
@@ -125,17 +125,17 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
             exchange = filteredBandwidths[currentIndex];
             currentIndex++;
         }
-        
-        MPI_Bcast(&exchange, 1, MPI_DOUBLE, copy.executingMPIrank, MPI_COMM_WORLD); 
+
+        MPI_Bcast(&exchange, 1, MPI_DOUBLE, copy.executingMPIrank, MPI_COMM_WORLD);
         results.push_back(exchange);
     }
 
     for (int i = 0; i < filteredCopies.size(); i++) {
         CU_ASSERT(cuStreamDestroy(filteredStreams[i]));
-        CU_ASSERT(cuEventDestroy(filteredStartEvents[i]));    
-        CU_ASSERT(cuEventDestroy(filteredEndEvents[i]));    
+        CU_ASSERT(cuEventDestroy(filteredStartEvents[i]));
+        CU_ASSERT(cuEventDestroy(filteredEndEvents[i]));
     }
-    
+
     return results;
 }
 
@@ -174,7 +174,7 @@ static nvmlDevice_t getNvmlDevice(int device) {
     CU_ASSERT(cuDeviceGetUuid_v2(&uuid, device));
 
     std::string nvmlUuid = convertUuid(uuid);
-    
+
     nvmlDevice_t nvmlDev;
     NVML_ASSERT(nvmlDeviceGetHandleByUUID((const char *) nvmlUuid.c_str(), &nvmlDev));
     return nvmlDev;
@@ -200,7 +200,7 @@ static int checkCliques() {
 
     for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
         if (0 != memcmp(&fabricInfo.clusterUuid, &clusterUuidArray[i * NVML_GPU_FABRIC_UUID_LEN], NVML_GPU_FABRIC_UUID_LEN)) {
-            std::cerr << "Process " << MPIWrapper::getWorldRank() << " clusterUuid=" << ((unsigned long *)&fabricInfo.clusterUuid)[0] << ";" << ((unsigned long *)&fabricInfo.clusterUuid)[1] << 
+            std::cerr << "Process " << MPIWrapper::getWorldRank() << " clusterUuid=" << ((unsigned long *)&fabricInfo.clusterUuid)[0] << ";" << ((unsigned long *)&fabricInfo.clusterUuid)[1] <<
                 " is different than process " << i << " clusterUuid=" << ((unsigned long *)&clusterUuidArray[i * NVML_GPU_FABRIC_UUID_LEN])[0] << ";" <<  ((unsigned long *)&clusterUuidArray[i * NVML_GPU_FABRIC_UUID_LEN])[1] << std::endl;
             ASSERT(0);
         }
@@ -239,7 +239,7 @@ static std::string getHostname() {
     return std::string(_hostname);
 }
 
-void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int> > _rackToProcessMap) { 
+void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int> > _rackToProcessMap) {
     localDevice = _localDevice;
     rackToProcessMap = _rackToProcessMap;
     CU_ASSERT(cuInit(0));
@@ -257,7 +257,7 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
     checkCliques();
 };
 
-void NvLoom::finalize() { 
+void NvLoom::finalize() {
     int initialized;
     MPI_Initialized(&initialized);
     if (initialized) {

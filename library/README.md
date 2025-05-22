@@ -25,9 +25,9 @@ This class is meant to be a base for inheritance of your custom allocators.
 
 Sample implementations of the class include `MultinodeMemoryAllocationUnicast`, `MultinodeMemoryAllocationEGM`, `MultinodeMemoryAllocationMulticast`, `DeviceMemoryAllocation` and `HostMemoryAllocation`/
 
-## Copy direction 
+## Copy direction
 
-Each copy can be either a "read" or a "write". 
+Each copy can be either a "read" or a "write".
 
 When copying memory from GPU A to B, the copy can be executed by either GPU.
 
@@ -87,7 +87,7 @@ The library needs to be initialized by calling `NvLoom::initialize(int _localDev
 
 Each process owns one GPU. Your application needs to tell the library which local GPU it owns (`cudaSetDevice` ordering).
 
-Determining which process owns which device is a problem with multiple solutions, each with its own pros and cons. The `nvloom` library is supposed to be as flexible as possible, which is why it leaves the choice to the library user. 
+Determining which process owns which device is a problem with multiple solutions, each with its own pros and cons. The `nvloom` library is supposed to be as flexible as possible, which is why it leaves the choice to the library user.
 
 Example strategies for determining which process owns which GPU are:
 - processes exchange hostnames through MPI and figure out the ordering based on the hostnames (implemented in the `nvloom-cli`)
@@ -95,7 +95,7 @@ Example strategies for determining which process owns which GPU are:
 
 ### Rack to process map
 
-Optional argument, providing information about NVLink topology. 
+Optional argument, providing information about NVLink topology.
 
 Each key is a rack name (most likely its GUID, but it's up to the library user).
 

@@ -132,7 +132,7 @@ void OutputMatrix::incrementalPrint(int stage) {
     if (stage % dimX == 0) {
         OUTPUT << labelsY[stage / dimX] << "\t";
     }
-    
+
     if (data[stage] == 0) {
         OUTPUT << "N/A";
     } else {

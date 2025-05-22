@@ -205,7 +205,7 @@ __global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize) {
 
     while ((char *) dst < dstEnd) {
         write(dst, curand(&state));
-        dst += totalThreadCount; 
+        dst += totalThreadCount;
     }
 }
 
@@ -252,8 +252,8 @@ __global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, un
             atomicAdd(errorCount, 1);
             // Only report one error per thread to avoid spamming prints
             break;
-        } 
-        buffer += totalThreadCount; 
+        }
+        buffer += totalThreadCount;
     }
 }
 
