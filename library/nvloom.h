@@ -48,12 +48,12 @@ public:
     CopyType copyType;
     int executingMPIrank;
 
-    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType) : 
-        dst(_dst), 
-        src(_src), 
-        copyDirection(_copyDirection), 
+    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType) :
+        dst(_dst),
+        src(_src),
+        copyDirection(_copyDirection),
         copyType(_copyType) {
-        
+
         if (copyDirection == COPY_DIRECTION_READ) {
             executingMPIrank = dst->MPIrank;
         } else {
@@ -120,7 +120,7 @@ private:
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
     static void doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount);
 
-public: 
+public:
     static std::vector<double> doBenchmark(std::vector<Copy> copies);
 
     static int getLocalDevice() { return localDevice; };

@@ -26,6 +26,11 @@
 // returns which GPU should this process run on
 int discoverRanks(std::map<std::string, std::vector<int>> &rackToProcessMap);
 
+enum Buffering {
+    BUFFERING_ENABLED,
+    BUFFERING_DISABLED
+};
+
 class OutputMatrix {
 private:
     std::string name;
@@ -38,6 +43,7 @@ private:
     std::vector<std::string> labelsX;
     std::vector<std::string> labelsY;
     std::vector<int> columnSeparators;
+    Buffering buffering;
 
     void fillLabels(std::vector<std::string>& vec, int size) {
         for (int i = 0; i < size; i++) {
@@ -48,7 +54,7 @@ private:
     void incrementalPrint(int stage);
 
 public:
-    OutputMatrix(std::string _name, int _dimX, int _dimY) : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, "") {
+    OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED) : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering) {
         fillLabels(labelsX, dimX);
         fillLabels(labelsY, dimY);
     }
@@ -64,25 +70,25 @@ public:
         for (auto elem : data) {
             if (elem != 0) {
                 filteredData.push_back(elem);
-            } 
+            }
         }
 
         if (filteredData.size() == 0) {
             OUTPUT << std::endl;
-            OUTPUT << "MinBW " << name << " N/A" << std::endl;
-            OUTPUT << "AvgBW " << name << " N/A" << std::endl;
-            OUTPUT << "MaxBW " << name << " N/A" << std::endl;
-            OUTPUT << "TotalBW " << name << " N/A" << std::endl;
+            OUTPUT << "MinBW " << name << " N/A GB/s" << std::endl;
+            OUTPUT << "AvgBW " << name << " N/A GB/s" << std::endl;
+            OUTPUT << "MaxBW " << name << " N/A GB/s" << std::endl;
+            OUTPUT << "TotalBW " << name << " N/A GB/s" << std::endl;
             OUTPUT << std::endl;
         } else {
             auto sum = std::reduce(filteredData.begin(), filteredData.end());
             auto [min, max] = std::minmax_element(filteredData.begin(), filteredData.end());
             OUTPUT << std::endl;
             OUTPUT << std::fixed << std::setprecision(2);
-            OUTPUT << "MinBW " << name << " " << *min << std::endl;
-            OUTPUT << "AvgBW " << name << " " << sum / filteredData.size() << std::endl;
-            OUTPUT << "MaxBW " << name << " " << *max << std::endl;
-            OUTPUT << "TotalBW " << name << " " << sum << std::endl;
+            OUTPUT << "MinBW " << name << " " << *min << " GB/s" << std::endl;
+            OUTPUT << "AvgBW " << name << " " << sum / filteredData.size() << " GB/s" << std::endl;
+            OUTPUT << "MaxBW " << name << " " << *max << " GB/s" << std::endl;
+            OUTPUT << "TotalBW " << name << " " << sum << " GB/s" << std::endl;
             OUTPUT << std::endl;
         }
     }
@@ -92,12 +98,12 @@ public:
         ASSERT(x < dimX);
         ASSERT(y >= 0);
         ASSERT(y < dimY);
-        
+
         int id = y * dimX + x;
         data[id] = value;
         notes[id] = note;
         initialized[id] = true;
-        if (currentlyPrinted == id) {
+        if (buffering == BUFFERING_ENABLED && currentlyPrinted == id) {
             int i = id;
             while (initialized[i] && i < dimX * dimY) {
                 incrementalPrint(i);
@@ -112,7 +118,7 @@ public:
         ASSERT(x < dimX);
         ASSERT(y >= 0);
         ASSERT(y < dimY);
-        return data[y * dimX + x]; 
+        return data[y * dimX + x];
     }
 
     void setLabelsX(std::vector<std::string> _labelsX) {
@@ -129,5 +135,14 @@ public:
         columnSeparators = _columnSeparators;
     }
 };
+
+template <typename T, typename U>
+static std::vector<T> getKeys(const std::map<T, U> &map) {
+    std::vector<T> keys;
+    for (auto &pair : map) {
+        keys.push_back(pair.first);
+    }
+    return keys;
+}
 
 #endif  // UTIL_H_

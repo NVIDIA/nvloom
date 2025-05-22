@@ -42,13 +42,24 @@ set(src
     library/kernels.cu
 )
 
+execute_process(
+    COMMAND git describe --always --tags
+    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 add_executable(nvloom_cli ${src})
 target_include_directories(nvloom_cli PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${CMAKE_CURRENT_SOURCE_DIR}/library .)
 target_link_libraries(nvloom_cli cuda nvidia-ml Boost::program_options)
 
-set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
+    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100;103")
+else()
+    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100")
+endif()
 
 find_package(MPI REQUIRED)
 include_directories(SYSTEM ${MPI_INCLUDE_PATH})
 target_link_libraries(nvloom_cli MPI::MPI_CXX)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DMULTINODE")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGIT_COMMIT=\\\"\"${GIT_COMMIT}\"\\\"")

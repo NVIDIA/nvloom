@@ -55,7 +55,7 @@ double doUnidir(int i, int j, size_t copySize) {
     std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
     std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, j);
     Copy copy(dst, src, copyDirection, copyType);
-    
+
     auto results = NvLoom::doBenchmark({copy});
     return results[0];
 }
@@ -65,7 +65,7 @@ double doBidir(int i, int j, size_t copySize) {
     std::shared_ptr<srcAllocator> src1 = std::make_shared<srcAllocator>(copySize, i);
     std::shared_ptr<dstAllocator> dst1 = std::make_shared<dstAllocator>(copySize, j);
     Copy copy1(dst1, src1, copyDirection, copyType);
-    
+
     std::shared_ptr<srcAllocator> src2 = std::make_shared<srcAllocator>(copySize, j);
     std::shared_ptr<dstAllocator> dst2 = std::make_shared<dstAllocator>(copySize, i);
     Copy copy2(dst2, src2, copyDirection, copyType);
@@ -102,7 +102,7 @@ public:
     }
 
     std::string getName() {
-        return srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(copyCount) + 
+        return srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(copyCount) +
         "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
@@ -127,7 +127,7 @@ public:
     }
 
     std::string getName() {
-        return srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(COPY_COUNT_BIDIR) + 
+        return srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(COPY_COUNT_BIDIR) +
         "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
@@ -171,7 +171,7 @@ public:
 
         for (int targetDevice = 0; targetDevice < MPIWrapper::getWorldSize(); targetDevice++) {
             std::vector<Copy> copies;
-            
+
             for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
                 if (i == targetDevice) continue;
                 std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, targetDevice);
@@ -199,7 +199,7 @@ public:
         for (int targetDevice = 0; targetDevice < MPIWrapper::getWorldSize(); targetDevice++) {
             std::vector<Copy> copies;
             std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, targetDevice);
-            
+
             for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
                 if (i == targetDevice) continue;
                 std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, i);
@@ -222,12 +222,12 @@ template <typename dstAllocator, typename srcAllocator, CopyType copyType>
 class multicast_one_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator> {
 public:
     void run(size_t copySize) {
-        OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize());
+        OutputMatrix output(getName(), 1, MPIWrapper::getWorldSize(), BUFFERING_DISABLED);
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
             std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, i);
             Copy copy(dst, src, COPY_DIRECTION_WRITE, copyType);
-                
+
             auto results = NvLoom::doBenchmark({copy});
             output.set(0, i, results[0]);
         }
@@ -252,7 +252,7 @@ public:
 
         auto results = NvLoom::doBenchmark(copies);
 
-        OutputMatrix output(getName(), 1, 1);
+        OutputMatrix output(getName(), 1, 1, BUFFERING_DISABLED);
         output.set(0, 0, std::reduce(results.begin(), results.end()));
     }
 
@@ -274,7 +274,7 @@ std::vector<int> pickRandomSamplesWithSkip(std::vector<int> elems, int samples, 
         std::iter_swap(elemToSkip, elems.end() - 1);
         elems.pop_back();
     }
-    
+
     std::vector<int> pickedElems;
     for (int i = 0; i < samples; i++) {
         std::uniform_int_distribution<std::mt19937::result_type> dist(0, elems.size() - 1);
@@ -307,7 +307,7 @@ std::mt19937 init_rng() {
     std::random_device random_dev;
     int seed = random_dev();
     // make sure all processes use the same seed
-    MPI_Bcast(&seed, 1, MPI_INT, 0, MPI_COMM_WORLD); 
+    MPI_Bcast(&seed, 1, MPI_INT, 0, MPI_COMM_WORLD);
     std::mt19937 rng(seed);
     return rng;
 }
@@ -316,24 +316,23 @@ template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirect
 class gpu_to_rack : public TestcaseDstSrc<dstAllocator, srcAllocator> {
 public:
     void run(size_t copySize) {
-        int samples = 5;
         std::mt19937 rng = init_rng();
 
         int columns = NvLoom::getRackToProcessMap().size();
         if (richOutput) {
-            columns *= samples;
+            columns *= gpuToRackSamples;
         }
         OutputMatrix output(getName(), columns, MPIWrapper::getWorldSize());
-    
+
         std::vector<std::string> columnLabels;
 
         for (auto const& elem : NvLoom::getRackToProcessMap()) {
             if (richOutput) {
-                for (int i = 0; i < samples; i++) {
+                for (int i = 0; i < gpuToRackSamples; i++) {
                     columnLabels.push_back(elem.first + "-" + std::to_string(i));
                 }
             } else {
-                columnLabels.push_back(elem.first); 
+                columnLabels.push_back(elem.first);
             }
         }
 
@@ -341,27 +340,27 @@ public:
 
         std::vector<int> columnSeparators;
         for (int i = 0; i < NvLoom::getRackToProcessMap().size() - 1; i++) {
-            columnSeparators.push_back((i + 1) * samples - 1);
+            columnSeparators.push_back((i + 1) * gpuToRackSamples - 1);
         }
         output.setColumnSeparators(columnSeparators);
-        
+
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             int j = 0;
             for (auto& elem : NvLoom::getRackToProcessMap()) {
                 std::vector<double> results;
 
-                auto peers = pickRandomSamplesWithSkip(elem.second, samples, i, rng);
+                auto peers = pickRandomSamplesWithSkip(elem.second, gpuToRackSamples, i, rng);
                 for (auto peerGPU : peers) {
                     // double check that the copy is executed in correct direction
                     double bandwidth = doUnidirBidirHelper<dstAllocator, srcAllocator, copyDirection, copyType, copyCount>(i, peerGPU, copySize);
                     results.push_back(bandwidth);
                 }
-                
+
                 if (richOutput) {
                     for (int x = 0; x < results.size(); x++) {
                         std::stringstream note;
-                        note << i << "-" << peers[x]; 
-                        output.set(samples * j + x, i, results[x], note.str());
+                        note << i << "-" << peers[x];
+                        output.set(gpuToRackSamples * j + x, i, results[x], note.str());
                     }
                 } else {
                     output.set(j, i, getMedian(results));
@@ -371,26 +370,22 @@ public:
             }
         }
     }
-    
+
     std::string getName() {
-        return "gpu_to_rack_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(copyCount) + 
+        return "gpu_to_rack_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + "_" + getCopyCountName(copyCount) +
         "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
-class rack_to_rack : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+class rack_to_rack_unidir : public TestcaseDstSrc<dstAllocator, srcAllocator> {
 public:
     void run(size_t copySize) {
-        std::mt19937 rng = init_rng();
-
         OutputMatrix output(getName(), NvLoom::getRackToProcessMap().size(), NvLoom::getRackToProcessMap().size());
-        std::vector<std::string> columnLabels;
-        for (auto const& elem : NvLoom::getRackToProcessMap()) {
-            columnLabels.push_back(elem.first); 
-        }
-        output.setLabelsX(columnLabels);
-        output.setLabelsY(columnLabels);
+
+        auto rackKeys = getKeys(NvLoom::getRackToProcessMap());
+        output.setLabelsX(rackKeys);
+        output.setLabelsY(rackKeys);
 
         int i = 0;
         for (auto const& rack : NvLoom::getRackToProcessMap()) {
@@ -405,13 +400,9 @@ public:
 
                 std::vector<Copy> copies;
                 for (int i = 0; i < peerCount; i++) {
-                    std::shared_ptr<srcAllocator> src1 = std::make_shared<srcAllocator>(copySize, rack.second[i]);
-                    std::shared_ptr<dstAllocator> dst1 = std::make_shared<dstAllocator>(copySize, peerRack.second[i]);
-                    copies.push_back(Copy(dst1, src1, copyDirection, copyType));
-
-                    std::shared_ptr<srcAllocator> src2 = std::make_shared<srcAllocator>(copySize, peerRack.second[i]);
-                    std::shared_ptr<dstAllocator> dst2 = std::make_shared<dstAllocator>(copySize, rack.second[i]);
-                    copies.push_back(Copy(dst2, src2, copyDirection, copyType));
+                    std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, rack.second[i]);
+                    std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, peerRack.second[i]);
+                    copies.push_back(Copy(dst, src, copyDirection, copyType));
                 }
 
                 auto results = NvLoom::doBenchmark(copies);
@@ -423,7 +414,54 @@ public:
     }
 
     std::string getName() {
-        return "rack_to_rack_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() + 
+        return "rack_to_rack_unidir_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() +
+        "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
+    }
+};
+
+template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
+class rack_to_rack_bidir : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+public:
+    void run(size_t copySize) {
+        OutputMatrix output(getName(), NvLoom::getRackToProcessMap().size(), NvLoom::getRackToProcessMap().size());
+
+        auto rackKeys = getKeys(NvLoom::getRackToProcessMap());
+        output.setLabelsX(rackKeys);
+        output.setLabelsY(rackKeys);
+
+        for (int i = 0; i < rackKeys.size(); i++) {
+            for (int j = i; j < rackKeys.size(); j++) {
+                if (i == j) {
+                    output.set(i, i, 0);
+                    continue;
+                }
+
+                auto origRack = NvLoom::getRackToProcessMap()[rackKeys[i]];
+                auto peerRack = NvLoom::getRackToProcessMap()[rackKeys[j]];
+
+                int peerCount = std::min(origRack.size(), peerRack.size());
+
+                std::vector<Copy> copies;
+                for (int iter = 0; iter < peerCount; iter++) {
+                    std::shared_ptr<srcAllocator> src1 = std::make_shared<srcAllocator>(copySize, origRack[iter]);
+                    std::shared_ptr<dstAllocator> dst1 = std::make_shared<dstAllocator>(copySize, peerRack[iter]);
+                    copies.push_back(Copy(dst1, src1, copyDirection, copyType));
+
+                    std::shared_ptr<srcAllocator> src2 = std::make_shared<srcAllocator>(copySize, peerRack[iter]);
+                    std::shared_ptr<dstAllocator> dst2 = std::make_shared<dstAllocator>(copySize, origRack[iter]);
+                    copies.push_back(Copy(dst2, src2, copyDirection, copyType));
+                }
+
+                auto results = NvLoom::doBenchmark(copies);
+                auto sum = std::reduce(results.begin(), results.end());
+                output.set(i, j, sum);
+                output.set(j, i, sum);
+            }
+        }
+    }
+
+    std::string getName() {
+        return "rack_to_rack_bidir_" + srcAllocator::getName() + "_to_" + dstAllocator::getName() +
         "_" + getCopyDirectionName(copyDirection) + "_" + getCopyTypeName(copyType);
     }
 };
@@ -431,13 +469,13 @@ public:
 static void addTestcase(
         std::map<std::string, std::vector<std::string> > &suites,
         std::string suiteName,
-        std::map<std::string, std::unique_ptr<Testcase> > &testcases, 
+        std::map<std::string, std::unique_ptr<Testcase> > &testcases,
         std::unique_ptr<Testcase> &&testcase) {
-    
+
     if (suiteName.size() > 0) {
         suites[suiteName].push_back(testcase->getName());
     }
-    
+
     testcases[testcase->getName()] = std::move(testcase);
 }
 
@@ -496,21 +534,26 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, COPY_COUNT_BIDIR> >());
 
     // rack-to-rack fabric saturation
-    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
-    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
-    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
-    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
+
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
 
     return {std::move(testcases), std::move(suites)};
 }
 
 std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::string, std::vector<std::string> > > buildTestcases(AllocatorStrategy strategy) {
     if (strategy == ALLOCATOR_STRATEGY_UNIQUE) {
-        return buildTestcasesLower< MultinodeMemoryAllocationUnicast, 
+        return buildTestcasesLower< MultinodeMemoryAllocationUnicast,
                                     MultinodeMemoryAllocationEGM,
                                     MultinodeMemoryAllocationMulticast>();
     } else if (strategy == ALLOCATOR_STRATEGY_REUSE) {
-        return buildTestcasesLower< AllocationPool<MultinodeMemoryAllocationUnicast>, 
+        return buildTestcasesLower< AllocationPool<MultinodeMemoryAllocationUnicast>,
                                     AllocationPool<MultinodeMemoryAllocationEGM>,
                                     AllocationPool<MultinodeMemoryAllocationMulticast> >();
     }

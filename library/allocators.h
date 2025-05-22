@@ -54,7 +54,7 @@ class DeviceMemoryAllocation : public MemoryAllocation {
 public:
     DeviceMemoryAllocation(size_t _allocationSize, int _MPIrank);
     ~DeviceMemoryAllocation();
-    
+
     // not used in benchmarks
     static std::string getName() {
         return "N/A";
@@ -119,6 +119,7 @@ private:
 public:
     MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank);
     ~MultinodeMemoryAllocationMulticast();
+    CUresult tryAllocation(size_t _allocationSize, int _MPIrank);
     static bool filter();
     static std::string getName() {
         return "multicast";
@@ -136,7 +137,7 @@ private:
 public:
     AllocationPool(size_t _allocationSize, int _MPIrank);
     ~AllocationPool();
-    
+
     static void clear();
     static bool filter();
 
