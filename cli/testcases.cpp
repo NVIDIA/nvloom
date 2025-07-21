@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,6 +47,8 @@ std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_CE) return "ce";
     if (copyType == COPY_TYPE_SM) return "sm";
     if (copyType == COPY_TYPE_MULTICAST_WRITE) return "mc";
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
+    if (copyType == COPY_TYPE_MULTICAST_RED_ALL or copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
     return "";
 }
 
@@ -54,7 +56,7 @@ template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirect
 double doUnidir(int i, int j, size_t copySize) {
     std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
     std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, j);
-    Copy copy(dst, src, copyDirection, copyType);
+    Copy copy(dst, src, copyDirection, copyType, iterations);
 
     auto results = NvLoom::doBenchmark({copy});
     return results[0];
@@ -64,11 +66,11 @@ template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirect
 double doBidir(int i, int j, size_t copySize) {
     std::shared_ptr<srcAllocator> src1 = std::make_shared<srcAllocator>(copySize, i);
     std::shared_ptr<dstAllocator> dst1 = std::make_shared<dstAllocator>(copySize, j);
-    Copy copy1(dst1, src1, copyDirection, copyType);
+    Copy copy1(dst1, src1, copyDirection, copyType, iterations);
 
     std::shared_ptr<srcAllocator> src2 = std::make_shared<srcAllocator>(copySize, j);
     std::shared_ptr<dstAllocator> dst2 = std::make_shared<dstAllocator>(copySize, i);
-    Copy copy2(dst2, src2, copyDirection, copyType);
+    Copy copy2(dst2, src2, copyDirection, copyType, iterations);
 
     auto results = NvLoom::doBenchmark({copy1, copy2});
     return results[0] + results[1];
@@ -142,7 +144,7 @@ public:
             int peer = (i + MPIWrapper::getWorldSize() / 2) % MPIWrapper::getWorldSize();
             std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
             std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, peer);
-            copies.push_back(Copy(dst, src, copyDirection, copyType));
+            copies.push_back(Copy(dst, src, copyDirection, copyType, iterations));
 
             std::stringstream s;
             s << i << "->" << peer;
@@ -176,7 +178,7 @@ public:
                 if (i == targetDevice) continue;
                 std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, targetDevice);
                 std::shared_ptr<srcAllocator> srcAlloc = std::make_shared<srcAllocator>(copySize, i);
-                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_WRITE, copyType));
+                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_WRITE, copyType, iterations));
             }
 
             auto results = NvLoom::doBenchmark(copies);
@@ -203,7 +205,7 @@ public:
             for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
                 if (i == targetDevice) continue;
                 std::shared_ptr<dstAllocator> dstAlloc = std::make_shared<dstAllocator>(copySize, i);
-                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_READ, copyType));
+                copies.push_back(Copy(dstAlloc, srcAlloc, COPY_DIRECTION_READ, copyType, iterations));
             }
 
             auto results = NvLoom::doBenchmark(copies);
@@ -218,7 +220,7 @@ public:
 };
 
 
-template <typename dstAllocator, typename srcAllocator, CopyType copyType>
+template <typename dstAllocator, typename srcAllocator, CopyType copyType, CopyDirection copyDirection>
 class multicast_one_to_all : public TestcaseDstSrc<dstAllocator, srcAllocator> {
 public:
     void run(size_t copySize) {
@@ -226,7 +228,7 @@ public:
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
             std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, i);
-            Copy copy(dst, src, COPY_DIRECTION_WRITE, copyType);
+            Copy copy(dst, src, copyDirection, copyType, iterations);
 
             auto results = NvLoom::doBenchmark({copy});
             output.set(0, i, results[0]);
@@ -234,7 +236,13 @@ public:
     }
 
     std::string getName() {
-        return "multicast_one_to_all_" + getCopyTypeName(copyType);
+        std::string direction;
+        if constexpr(copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+            direction = "all_to_one";
+        } else {
+            direction = "one_to_all";
+        }
+        return "multicast_" + direction + "_" + getCopyTypeName(copyType);
     }
 };
 
@@ -244,10 +252,12 @@ public:
     void run(size_t copySize) {
         std::vector<Copy> copies;
 
+        dstAllocator::setCapacityHint(MPIWrapper::getWorldSize());
+
         for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
             std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
             std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, i);
-            copies.push_back(Copy(dst, src, COPY_DIRECTION_WRITE, copyType));
+            copies.push_back(Copy(dst, src, COPY_DIRECTION_WRITE, copyType, iterations));
         }
 
         auto results = NvLoom::doBenchmark(copies);
@@ -258,6 +268,59 @@ public:
 
     std::string getName() {
         return "multicast_all_to_all_" + getCopyTypeName(copyType);
+    }
+};
+
+template <typename dstAllocator, typename srcAllocator>
+class multicast_all_to_all_ld_reduce : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+public:
+    void run(size_t copySize) {
+        std::vector<Copy> copies;
+
+        std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, 0);
+
+        for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+            std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, i);
+            copies.push_back(Copy(dst, src, COPY_DIRECTION_READ, COPY_TYPE_MULTICAST_LD_REDUCE, iterations));
+        }
+
+        auto results = NvLoom::doBenchmark(copies);
+
+        OutputMatrix output(getName(), 1, 1, BUFFERING_DISABLED);
+        output.set(0, 0, std::reduce(results.begin(), results.end()));
+    }
+
+    std::string getName() {
+        return "multicast_all_to_all_" + getCopyTypeName(COPY_TYPE_MULTICAST_LD_REDUCE);
+    }
+};
+
+template <typename dstAllocator, typename srcAllocator>
+class multicast_all_to_all_red : public TestcaseDstSrc<dstAllocator, srcAllocator> {
+public:
+    void run(size_t copySize) {
+        OutputMatrix output(getName(), 1, 1, BUFFERING_DISABLED);
+
+        std::vector<Copy> copies;
+        std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, 0);
+
+        for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+            std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, i);
+            Copy copy(dst, src, COPY_DIRECTION_WRITE, COPY_TYPE_MULTICAST_RED_ALL, iterations);
+            copies.push_back(copy);
+
+            // For the multicast_all_to_all_red testcase, we need to make sure that all source have the same uniqueId
+            // Otherwise validation will fail
+            // Each buffer is still unique, because the contents depend on both uniqueId and GPU_ID
+            src->uniqueId = copies[0].src->uniqueId;
+        }
+
+        auto results = NvLoom::doBenchmark(copies);
+        output.set(0, 0, std::reduce(results.begin(), results.end()));
+    }
+
+    std::string getName() {
+        return "multicast_all_to_all_" + getCopyTypeName(COPY_TYPE_MULTICAST_RED_ALL);
     }
 };
 
@@ -402,7 +465,7 @@ public:
                 for (int i = 0; i < peerCount; i++) {
                     std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, rack.second[i]);
                     std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, peerRack.second[i]);
-                    copies.push_back(Copy(dst, src, copyDirection, copyType));
+                    copies.push_back(Copy(dst, src, copyDirection, copyType, iterations));
                 }
 
                 auto results = NvLoom::doBenchmark(copies);
@@ -445,11 +508,11 @@ public:
                 for (int iter = 0; iter < peerCount; iter++) {
                     std::shared_ptr<srcAllocator> src1 = std::make_shared<srcAllocator>(copySize, origRack[iter]);
                     std::shared_ptr<dstAllocator> dst1 = std::make_shared<dstAllocator>(copySize, peerRack[iter]);
-                    copies.push_back(Copy(dst1, src1, copyDirection, copyType));
+                    copies.push_back(Copy(dst1, src1, copyDirection, copyType, iterations));
 
                     std::shared_ptr<srcAllocator> src2 = std::make_shared<srcAllocator>(copySize, peerRack[iter]);
                     std::shared_ptr<dstAllocator> dst2 = std::make_shared<dstAllocator>(copySize, origRack[iter]);
-                    copies.push_back(Copy(dst2, src2, copyDirection, copyType));
+                    copies.push_back(Copy(dst2, src2, copyDirection, copyType, iterations));
                 }
 
                 auto results = NvLoom::doBenchmark(copies);
@@ -508,8 +571,14 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "all-to-one", testcases, std::make_unique<all_from_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM> >());
 
     // multicast
-    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, unicastAllocator, COPY_TYPE_MULTICAST_WRITE> >());
-    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all<multicastAllocator, unicastAllocator, COPY_TYPE_MULTICAST_WRITE> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE> >());
+
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<DeviceMemoryAllocation, multicastAllocator, COPY_TYPE_MULTICAST_LD_REDUCE, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all_ld_reduce<DeviceMemoryAllocation, multicastAllocator> >());
+
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_RED_SINGLE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "multicast", testcases, std::make_unique<multicast_all_to_all_red<multicastAllocator, DeviceMemoryAllocation> >());
 
     // egm
     addTestcase(suites, "egm", testcases, std::make_unique<N_squared_pattern<egmAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
@@ -555,7 +624,11 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     } else if (strategy == ALLOCATOR_STRATEGY_REUSE) {
         return buildTestcasesLower< AllocationPool<MultinodeMemoryAllocationUnicast>,
                                     AllocationPool<MultinodeMemoryAllocationEGM>,
-                                    AllocationPool<MultinodeMemoryAllocationMulticast> >();
+                                    MulticastPool>();
+    } else if (strategy == ALLOCATOR_STRATEGY_CUDA_POOLS) {
+        return buildTestcasesLower< MultinodeMemoryPoolAllocationUnicast,
+                                    MultinodeMemoryPoolAllocationEGM,
+                                    MultinodeMemoryAllocationMulticast>();
     }
     ASSERT(0);
 }

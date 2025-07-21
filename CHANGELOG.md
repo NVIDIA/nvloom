@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0] - 2025-07-21
+
+### Added
+- Multicast reductions benchmarks
+- Option to specify iteration count (-i/--iterations)
+- Option to repeat a testcase for a specified number of iterations (-c/--repeat)
+- Option to repeat a testcase for a specified number of seconds (-d/--duration)
+- CUDA Stream Ordered Memory Allocator was added as a new allocator option (-a cudapool)
+
+### Changed
+- Caching multicast allocations is now much faster, thanks to multicast-specific memory pool
+
 ## [1.1.0] - 2025-05-22
 
 ### Added

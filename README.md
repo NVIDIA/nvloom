@@ -174,6 +174,28 @@ The default is 5 samples per rack.
 
 When `--richOutput` is enabled, all sample measurements will be shown. Otherwise, only the median value across the samples is reported.
 
+## --iterations
+The `--iterations` option controls how many copy operations are performed within each measurement, not including the initial warmup iteration.
+
+The default is 16.
+
+Controlled with `-i` or `--iterations` option.
+
+## --repeat
+The `--repeat` option controls how many times each testcase is executed in a single run. By default, each testcase is run once. You can use this option to repeat the same testcase multiple times.
+
+Controlled with `-c` or `--repeat` option.
+
+For example, `-c 10` will run each selected testcase 10 times in a row.
+
+## --duration
+
+The `--duration` option allows you to specify how long (in seconds) each testcase should be repeated. The testcase will be executed repeatedly until the specified duration has elapsed.
+
+Controlled with `-d` or `--duration` option.
+
+**Note:** You cannot specify both `--duration` and `--repeat` at the same time; only one of these options can be used per run. If neither is specified, each testcase will run once (the default).
+
 # Heatmap plotter
 
 `plot_heatmaps.py` included in the `nvloom_cli` directory produces heatmaps for each testcase of a given `nvloom_cli` output.
@@ -351,3 +373,24 @@ Bandwidth of the "continuous arrow" copy is reported, however it causes `NUM_GPU
 Multicast_all_to_all measures bandwidth of every single GPU broadcasting to every single GPU at the same time. In essence, it's `NUM_GPU` of `multicast_one_to_all` running simultaneously.
 
 Sum of all "continuous arrow" bandwidth is reported.
+
+### Multicast_one_to_all_red: multimem.red
+
+Each measurement in multicast_one_to_all_red performs an addition of data from a regular "device" buffer on the source GPU to a multicast allocation that's allocated on all GPUs in the job. Multimem.red PTX instruction is used for this reduction. For more information, see [Data Movement and Conversion Instructions: multimem.ld_reduce, multimem.st, multimem.red](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-multimem)
+
+![Diagram of multicast multimem.red traffic pattern](docs/multicast_red.png)
+
+### Multicast_all_to_all_red: multimem.red
+
+Multicast_all_to_all measures bandwidth of every single GPU adding data (reducing) to every single GPU at the same time. In essence, it's `NUM_GPU` of `multicast_one_to_all_red` running simultaneously.
+
+### Multicast_all_to_one_red: multimem.ld_reduce
+
+Each measurement in multicast_all_to_one_red performs a sum of data residing on all GPUs and saves the result to local memory. Multimem.ld_reduce PTX instruction is used for this reduction. For more information, see [Data Movement and Conversion Instructions: multimem.ld_reduce, multimem.st, multimem.red](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-multimem)
+
+![Diagram of multicast multimem.ld_reduce traffic pattern](docs/multicast_ld_reduce.png)
+
+### Multicast_all_to_all_ld_reduce: multimem.ld_reduce
+
+Multicast_all_to_all measures bandwidth of every single GPU reducing data from every single GPU at the same time. In essence, it's `NUM_GPU` of `Multicast_all_to_all_ld_reduce` running simultaneously.
+

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,10 +23,12 @@
 
 extern bool richOutput;
 extern int gpuToRackSamples;
+extern int iterations;
 
 enum AllocatorStrategy {
     ALLOCATOR_STRATEGY_UNIQUE = 0,
     ALLOCATOR_STRATEGY_REUSE,
+    ALLOCATOR_STRATEGY_CUDA_POOLS,
 };
 
 class Testcase {

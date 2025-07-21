@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,17 +21,18 @@
 #include "error.h"
 #include "kernels.cuh"
 #include "nvloom.h"
+#include "enums.h"
 
-unsigned long long MemoryAllocation::check(int value) {
+unsigned long long MemoryAllocation::check(int value, CopyType copyType, int iterations) {
     if (MPIrank == MPIWrapper::getWorldRank()) {
-        return checkBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD);
+        return checkBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, iterations);
     }
     return 0;
 }
 
-void MemoryAllocation::memset(int value) {
+void MemoryAllocation::memset(int value, CopyType copyType, MemoryPurpose memoryPurpose) {
     if (MPIrank == MPIWrapper::getWorldRank()) {
-        memsetBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD);
+        memsetBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, memoryPurpose);
     }
 }
 
@@ -259,17 +260,136 @@ MultinodeMemoryAllocationMulticast::~MultinodeMemoryAllocationMulticast() {
     CU_ASSERT(cuMemAddressFree((CUdeviceptr) ptr, roundedUpAllocationSize));
 }
 
-void MultinodeMemoryAllocationMulticast::memset(int value) {
-    memsetBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD);
+void MultinodeMemoryAllocationMulticastRef::memset(int value, CopyType copyType, MemoryPurpose memoryPurpose) {
+    memsetBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, memoryPurpose);
 }
 
-unsigned long long MultinodeMemoryAllocationMulticast::check(int value) {
-    return checkBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD);
+unsigned long long MultinodeMemoryAllocationMulticastRef::check(int value, CopyType copyType, int iterations) {
+    return checkBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, iterations);
 }
 
-bool MultinodeMemoryAllocationMulticast::filter() {
+bool MultinodeMemoryAllocationMulticastRef::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
+    return pi != 0;
+};
+
+std::vector<CUmemoryPool> MultinodeMemoryPoolAllocationBase::initPoolsLazy() {
+    std::vector<CUmemoryPool> pools;
+    pools.resize(MPIWrapper::getWorldSize());
+    fh_vector.resize(MPIWrapper::getWorldSize());
+    handleType = CU_MEM_HANDLE_TYPE_FABRIC;
+    poolProps.allocType = CU_MEM_ALLOCATION_TYPE_PINNED;
+    poolProps.handleTypes = handleType;
+    poolProps.location.type = mem_location;
+    cuuint64_t thresholdSize = 1073741824; // 1 GB in bytes;
+
+    if (mem_location == CU_MEM_LOCATION_TYPE_DEVICE) {
+        poolProps.location.id = NvLoom::getLocalDevice();
+    } else {
+        poolProps.location.id = NvLoom::getLocalCpuNumaNode();
+    }
+
+    CU_ASSERT(cuMemPoolCreate(&pools[MPIWrapper::getWorldRank()], &poolProps));
+
+    // Set pool release threshold to reserve 1GB before it releases memory back to the OS - Pending investigation @ https://gitlab-master.nvidia.com/dcse-appsys/nvloom/-/issues/24
+    CU_ASSERT(cuMemPoolSetAttribute(pools[MPIWrapper::getWorldRank()], CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &thresholdSize));
+    CU_ASSERT(cuMemPoolExportToShareableHandle(&fh_vector[MPIWrapper::getWorldRank()], pools[MPIWrapper::getWorldRank()], handleType, 0 /*flags*/));
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Import handles of other pools to fill vector
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        MPI_Bcast(&fh_vector[i], sizeof(CUmemFabricHandle), MPI_BYTE, i, MPI_COMM_WORLD);
+        if (i != MPIWrapper::getWorldRank()) {
+            CU_ASSERT(cuMemPoolImportFromShareableHandle(&pools[i], (void *)&fh_vector[i], handleType, 0));
+        }
+    }
+
+    // Set access for the pools
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        if (mem_location == CU_MEM_LOCATION_TYPE_HOST_NUMA) {
+            desc.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            desc.location.id = NvLoom::getLocalCpuNumaNode();
+            desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            CU_ASSERT(cuMemPoolSetAccess(pools[i], &desc, 1));
+        }
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id = NvLoom::getLocalCuDevice();
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_ASSERT(cuMemPoolSetAccess(pools[i], &desc, 1));
+    }
+    return pools;
+}
+
+MultinodeMemoryPoolAllocationBase::MultinodeMemoryPoolAllocationBase(size_t _allocationSize, int _MPIrank, CUmemLocationType location) {
+    allocationSize = _allocationSize;
+    MPIrank = _MPIrank;
+    mem_location = location;
+
+    if (!devicePoolsInitialized && mem_location == CU_MEM_LOCATION_TYPE_DEVICE) {
+        devicePoolsInitialized = true;
+        device_pools.resize((MPIWrapper::getWorldSize()));
+        device_pools = initPoolsLazy();
+    }
+
+    if (!egmPoolsInitialized && mem_location == CU_MEM_LOCATION_TYPE_HOST_NUMA) {
+        egmPoolsInitialized = true;
+        egm_pools.resize((MPIWrapper::getWorldSize()));
+        egm_pools = initPoolsLazy();
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (_MPIrank == MPIWrapper::getWorldRank() && mem_location == CU_MEM_LOCATION_TYPE_HOST_NUMA) {
+        CU_ASSERT(cuMemAllocFromPoolAsync((CUdeviceptr *)&ptr, allocationSize, egm_pools[_MPIrank], CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuMemPoolExportPointer(&data, (CUdeviceptr) ptr));
+    }
+    if (_MPIrank == MPIWrapper::getWorldRank() && mem_location == CU_MEM_LOCATION_TYPE_DEVICE) {
+        CU_ASSERT(cuMemAllocFromPoolAsync((CUdeviceptr *)&ptr, allocationSize, device_pools[_MPIrank], CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuMemPoolExportPointer(&data, (CUdeviceptr) ptr));
+    }
+
+    MPI_Bcast(&data, sizeof(data), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
+
+    if (_MPIrank != MPIWrapper::getWorldRank() && mem_location == CU_MEM_LOCATION_TYPE_HOST_NUMA) {
+        CU_ASSERT(cuMemPoolImportPointer((CUdeviceptr*) &ptr, egm_pools[_MPIrank], &data));
+    }
+    if (_MPIrank != MPIWrapper::getWorldRank() && mem_location == CU_MEM_LOCATION_TYPE_DEVICE){
+        CU_ASSERT(cuMemPoolImportPointer((CUdeviceptr*) &ptr, device_pools[_MPIrank], &data));
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+MultinodeMemoryPoolAllocationBase::~MultinodeMemoryPoolAllocationBase() {
+    CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+
+    if (MPIrank != MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuMemFreeAsync((CUdeviceptr) ptr, CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (MPIrank == MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuMemFreeAsync((CUdeviceptr) ptr, CU_STREAM_PER_THREAD));
+        CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+bool MultinodeMemoryPoolAllocationUnicast::filter() {
+    int pi;
+    CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, NvLoom::getLocalCuDevice()));
+    return pi != 0;
+};
+
+bool MultinodeMemoryPoolAllocationEGM::filter() {
+    int pi;
+    CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HOST_NUMA_MULTINODE_IPC_SUPPORTED, NvLoom::getLocalCuDevice()));
     return pi != 0;
 };
 
@@ -314,9 +434,54 @@ std::string AllocationPool<T>::getName() {
     return T::getName();
 }
 
+MulticastPool::MulticastPool(size_t _allocationSize, int _MPIrank) {
+    allocationSize = _allocationSize;
+    MPIrank = _MPIrank;
+
+    auto it = pool.find(allocationSize);
+
+    if (it == pool.end()) {
+        // Create one large allocation and suballocate it into smaller chunks
+        auto largeAllocation = std::make_shared<MultinodeMemoryAllocationMulticast>(insertCount * allocationSize, 0);
+        for (int i = 0; i < insertCount; i++) {
+            pool.insert({allocationSize, {largeAllocation, i}});
+        }
+
+        it = pool.find(allocationSize);
+    }
+
+    ASSERT(it != pool.end());
+
+    parent = it->second.first;
+    offset = it->second.second;
+    pool.erase(it);
+
+    ptr = (char *) parent->ptr + offset * allocationSize;
+    void *unicastMappingPtr = (char *) parent->unicastMappingPtr + (size_t) offset * allocationSize;
+
+    current = std::make_unique<MultinodeMemoryAllocationMulticastRef>(ptr, unicastMappingPtr, allocationSize, MPIrank);
+}
+
+MulticastPool::~MulticastPool() {
+    pool.insert({allocationSize, {parent, offset}});
+}
+
+void MulticastPool::clear() {
+    setCapacityHint(defaultInsertCount);
+    pool.clear();
+}
+
+bool MulticastPool::filter() {
+    return MultinodeMemoryAllocationMulticast::filter();
+}
+
+std::string MulticastPool::getName() {
+    return MultinodeMemoryAllocationMulticast::getName();
+}
+
 void clearAllocationPools() {
     AllocationPool<MultinodeMemoryAllocationUnicast>::clear();
-    AllocationPool<MultinodeMemoryAllocationMulticast>::clear();
     AllocationPool<MultinodeMemoryAllocationEGM>::clear();
     AllocationPool<HostMemoryAllocation>::clear();
+    MulticastPool::clear();
 }

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,19 +26,12 @@
 #include <mpi.h>
 #include <memory>
 #include "allocators.h"
+#include "enums.h"
 #include "error.h"
 #include "kernels.cuh"
 
-enum CopyDirection {
-    COPY_DIRECTION_WRITE = 0,
-    COPY_DIRECTION_READ,
-};
-
-enum CopyType {
-    COPY_TYPE_CE = 0,
-    COPY_TYPE_SM,
-    COPY_TYPE_MULTICAST_WRITE,
-};
+constexpr unsigned long long WARMUP_ITERATIONS = 1;
+constexpr unsigned long long DEFAULT_ITERATIONS = 16;
 
 class Copy {
 public:
@@ -47,12 +40,14 @@ public:
     CopyDirection copyDirection;
     CopyType copyType;
     int executingMPIrank;
+    int iterations;
 
-    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType) :
+    Copy(std::shared_ptr<MemoryAllocation> _dst, std::shared_ptr<MemoryAllocation> _src, CopyDirection _copyDirection, CopyType _copyType, int _iterations = DEFAULT_ITERATIONS) :
         dst(_dst),
         src(_src),
         copyDirection(_copyDirection),
-        copyType(_copyType) {
+        copyType(_copyType),
+        iterations(_iterations) {
 
         if (copyDirection == COPY_DIRECTION_READ) {
             executingMPIrank = dst->MPIrank;
@@ -115,10 +110,23 @@ private:
     static inline int localDevice;
     static inline CUdevice localCuDevice;
     static inline CUcontext localCtx;
+    static inline int localMultiprocessorCount;
+    static inline int localClockRate;
     static inline int localCpuNumaNode;
     static inline std::string localHostname;
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
+
+    // Launch loopCount copy iterations, unconditionally
     static void doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount);
+
+    // Launch up to loopCount iterations, accounting for the spinKernel guarded loop
+    // Returns the number of iterations actually launched
+    static unsigned long long doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount);
+
+    // Launch a single copy iteration
+    // Designed to be called after the spinKernel is released.
+    // NOOP for non-CE copies, as they're not impacted by the spinKernel issue.
+    static void doMemcpyBeyondSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream);
 
 public:
     static std::vector<double> doBenchmark(std::vector<Copy> copies);
@@ -126,8 +134,11 @@ public:
     static int getLocalDevice() { return localDevice; };
     static CUdevice getLocalCuDevice() { return localCuDevice; };
     static CUcontext getLocalCtx() { return localCtx; };
+    static int getLocalMultiprocessorCount() { return localMultiprocessorCount; };
+    static int getLocalClockRate() { return localClockRate; };
     static int getLocalCpuNumaNode() { return localCpuNumaNode; };
     static std::string getLocalHostname() { return localHostname; };
+    static unsigned long long getDefaultIterationCount() { return DEFAULT_ITERATIONS; };
 
     static std::map<std::string, std::vector<int> > getRackToProcessMap() { return rackToProcessMap; };
     static void initialize(int _localDevice, std::map<std::string, std::vector<int> > _rackToProcessMap = {});

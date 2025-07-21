@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,12 +17,16 @@
 
 #include "kernels.cuh"
 #include "error.h"
+#include "nvloom.h"
 #include <curand_kernel.h>
 
 const unsigned int numThreadPerBlock = 512;
 
 template<typename T>
 using write_to_memory = void (*)(T*, T);
+
+template<typename T>
+using reduce_from_memory = void (*)(T*, T*);
 
 template<typename T>
 __device__ void write_to_regular_memory(T *dst, T val) {
@@ -37,20 +41,21 @@ __device__ void write_to_multicast_memory(T *dst, T val) {
 #endif
 }
 
-typedef uint (*read_from_memory)(uint*);
-
-__device__ uint read_from_regular_memory(uint *dst) {
-    return *dst;
+template<typename T>
+__device__ void reduce_from_multicast_ld_reduce(T *dst, T *val) {
+#if __CUDA_ARCH__ >= 900
+    static_assert(sizeof(T) == 4, "");
+    uint result;
+    asm ("multimem.ld_reduce.weak.global.add.u32 %0, [%1];" : "=r"(result) : "l"(val) : "memory");
+    *dst = result;
+#endif
 }
 
-__device__ uint read_from_multicast_memory(uint *dst) {
+template<typename T>
+__device__ void reduce_from_multicast_red(T *dst, T *val) {
 #if __CUDA_ARCH__ >= 900
-    uint result;
-    static_assert(sizeof(uint) == 4, "");
-    asm ("multimem.ld_reduce.weak.global.and.b32 %0, [%1];" : "=r"(result) : "l"(dst) : "memory");
-    return result;
-#else
-    return 0;
+    static_assert(sizeof(T) == 4, "");
+    asm ("multimem.red.global.add.u32 [%0], %1;" : "+l"(dst) : "r"(*val) : "memory");
 #endif
 }
 
@@ -106,44 +111,51 @@ __global__ void stridingMemcpyKernel(unsigned int totalThreadCount, unsigned lon
     }
 }
 
-void copyKernelMulticast(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    CUdevice dev;
-    CUcontext ctx;
+template<typename T, reduce_from_memory<T> write>
+__global__ void simpleMemcpyKernel(unsigned int totalThreadCount, unsigned long long loopCount, T* dst, T* src, size_t sizeInElement) {
+    T *dstEnd = dst + sizeInElement;
 
-    CU_ASSERT(cuStreamGetCtx(stream, &ctx));
-    CU_ASSERT(cuCtxGetDevice(&dev));
+    size_t globalThreadId = blockDim.x * blockIdx.x + threadIdx.x;
+    dst += globalThreadId;
+    src += globalThreadId;
 
-    int numSm;
-    CU_ASSERT(cuDeviceGetAttribute(&numSm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
-    unsigned int totalThreadCount = numSm * numThreadPerBlock;
+    for (unsigned int i = 0; i < loopCount; i++) {
+        T* cdst = dst;
+        T* csrc = src;
+
+        while (cdst < dstEnd) {
+            write(cdst, csrc); cdst += totalThreadCount; csrc += totalThreadCount;
+        }
+    }
+}
+
+template<typename T, auto kernel>
+void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    unsigned int totalThreadCount = NvLoom::getLocalMultiprocessorCount() * numThreadPerBlock;
 
     // adjust size to elements (size is multiple of MB, so no truncation here)
-    size_t sizeInElement = size / sizeof(uint);
+    size_t sizeInElement = size / sizeof(T);
 
-    dim3 gridDim(numSm, 1, 1);
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
     dim3 blockDim(numThreadPerBlock, 1, 1);
-    stridingMemcpyKernel<uint, write_to_multicast_memory> <<<gridDim, blockDim, 0, stream>>> (totalThreadCount, loopCount, (uint *)dstBuffer, (uint *)srcBuffer, sizeInElement);
+    kernel <<<gridDim, blockDim, 0, stream>>> (totalThreadCount, loopCount, (T *) dstBuffer, (T *) srcBuffer, sizeInElement);
     CUDA_ASSERT(cudaPeekAtLastError());
 }
 
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    CUdevice dev;
-    CUcontext ctx;
+    launchCopyKernel<uint4, stridingMemcpyKernel<uint4, write_to_regular_memory> >(dstBuffer, srcBuffer, size, stream, loopCount);
+}
 
-    CU_ASSERT(cuStreamGetCtx(stream, &ctx));
-    CU_ASSERT(cuCtxGetDevice(&dev));
+void copyKernelMulticast(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernel<uint, stridingMemcpyKernel<uint, write_to_multicast_memory> >(dstBuffer, srcBuffer, size, stream, loopCount);
+}
 
-    int numSm;
-    CU_ASSERT(cuDeviceGetAttribute(&numSm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
-    unsigned int totalThreadCount = numSm * numThreadPerBlock;
+void copyKernelMulticastLdReduce(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_ld_reduce<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount);
+}
 
-    // adjust size to elements (size is multiple of MB, so no truncation here)
-    size_t sizeInElement = size / sizeof(uint4);
-
-    dim3 gridDim(numSm, 1, 1);
-    dim3 blockDim(numThreadPerBlock, 1, 1);
-    stridingMemcpyKernel<uint4, write_to_regular_memory> <<<gridDim, blockDim, 0, stream>>> (totalThreadCount, loopCount, (uint4 *)dstBuffer, (uint4 *)srcBuffer, sizeInElement);
-    CUDA_ASSERT(cudaPeekAtLastError());
+void copyKernelMulticastRed(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount);
 }
 
 __global__ void spinKernelDeviceMultistage(volatile int *latch1, volatile int *latch2, const unsigned long long timeoutClocks) {
@@ -174,27 +186,16 @@ __global__ void spinKernelDeviceMultistage(volatile int *latch1, volatile int *l
 // timeoutMs argument applies to each stage separately.
 // However, since each kernel will spin on only one stage, total runtime is still limited by timeoutMs
 CUresult spinKernelMultistage(volatile int *latch1, volatile int *latch2, CUstream stream, unsigned long long timeoutMs) {
-    int clocksPerMs = 0;
-    CUcontext ctx;
-    CUdevice dev;
-
     ASSERT(latch2 != nullptr);
 
-    CU_ASSERT(cuStreamGetCtx(stream, &ctx));
-    CU_ASSERT(cuCtxGetDevice(&dev));
-
-    CU_ASSERT(cuDeviceGetAttribute(&clocksPerMs, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, dev));
-
-    unsigned long long timeoutClocks = clocksPerMs * timeoutMs;
-
+    unsigned long long timeoutClocks = NvLoom::getLocalClockRate() * timeoutMs;
     spinKernelDeviceMultistage<<<1, 1, 0, stream>>>(latch1, latch2, timeoutClocks);
     CUDA_ASSERT(cudaPeekAtLastError());
 
     return CUDA_SUCCESS;
 }
 
-template<write_to_memory<uint> write>
-__global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize) {
+__global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int groupId, int groupSize) {
     unsigned long long threadId = blockDim.x * blockIdx.x + threadIdx.x;
     size_t totalThreadCount = gridDim.x * blockDim.x;
     char* dstEnd = ((char *) dst) + bufferSize;
@@ -203,38 +204,52 @@ __global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize) {
     curandStateXORWOW_t state;
     curand_init(seed, 0, threadId, &state);
 
+    for (int i = 0; i < groupId; i++) {
+        curand(&state);
+    }
+
     while ((char *) dst < dstEnd) {
-        write(dst, curand(&state));
+        *dst = curand(&state);
         dst += totalThreadCount;
+
+        for (int i = 0; i < groupSize - 1; i++) {
+            curand(&state);
+        }
     }
 }
 
-template<write_to_memory<uint> write>
-void memsetBufferGeneric(void *ptr, int seed, size_t size, CUstream stream) {
-    CUdevice dev;
-    CUcontext ctx;
-
-    CU_ASSERT(cuStreamGetCtx(stream, &ctx));
-    CU_ASSERT(cuCtxGetDevice(&dev));
-
-    int numSm;
-    CU_ASSERT(cuDeviceGetAttribute(&numSm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
-    dim3 gridDim(numSm, 1, 1);
+void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupId, int groupSize) {
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
     dim3 blockDim(numThreadPerBlock, 1, 1);
-    patternFillKernel<write> <<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size);
+    patternFillKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, groupId, groupSize);
     CUDA_ASSERT(cudaPeekAtLastError());
 }
 
-void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream) {
-    memsetBufferGeneric<write_to_regular_memory>(ptr, seed, size, stream);
+void zeroOutBuffer(void *ptr, size_t size, CUstream stream) {
+    CU_ASSERT(cuMemsetD8Async((CUdeviceptr) ptr, 0, size, stream));
 }
 
-void memsetBufferMulticast(void *ptr, int seed, size_t size, CUstream stream) {
-    memsetBufferGeneric<write_to_multicast_memory>(ptr, seed, size, stream);
+void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, MemoryPurpose memoryPurpose) {
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL) {
+        if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
+            memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
+        } else {
+            zeroOutBuffer(ptr, size, stream);
+        }
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
+            memsetBuffer(ptr, seed, size, stream, 0, 1);
+        } else {
+            zeroOutBuffer(ptr, size, stream);
+        }
+    } else {
+        memsetBuffer(ptr, seed, size, stream, 0, 1);
+    }
 }
 
-template<read_from_memory read>
-__global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, unsigned long long *errorCount) {
+__global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, unsigned long long *errorCount, int groupSize, int multiplier) {
     uint* originalBuffer = buffer;
     unsigned long long threadId = blockDim.x * blockIdx.x + threadIdx.x;
     size_t totalThreadCount = gridDim.x * blockDim.x;
@@ -245,8 +260,16 @@ __global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, un
     curand_init(seed, 0, threadId, &state);
 
     while ((char *) buffer < bufferEnd) {
-        uint expectedValue = curand(&state);
-        uint actualValue = read(buffer);
+        uint expectedValue = 0;
+
+        for (int i = 0; i < groupSize; i++) {
+            // overflow for uint is well defined
+            expectedValue += curand(&state);
+        }
+
+        expectedValue *= multiplier;
+
+        uint actualValue = *buffer;
         if (actualValue != expectedValue) {
             printf("Error found at byte offset %llu: expected %u but got %u\n", (char *) buffer - (char *) originalBuffer, expectedValue, actualValue);
             atomicAdd(errorCount, 1);
@@ -257,23 +280,14 @@ __global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, un
     }
 }
 
-template<read_from_memory read>
-unsigned long long checkBufferGeneric(void *ptr, int seed, size_t size, CUstream stream) {
-    CUdevice dev;
-    CUcontext ctx;
-
+unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupSize, int multiplier = 1) {
     unsigned long long *errorCount;
     CU_ASSERT(cuMemAlloc((CUdeviceptr *) &errorCount, sizeof(*errorCount)));
     CU_ASSERT(cuMemsetD8((CUdeviceptr) errorCount, 0, sizeof(*errorCount)));
 
-    CU_ASSERT(cuStreamGetCtx(stream, &ctx));
-    CU_ASSERT(cuCtxGetDevice(&dev));
-
-    int numSm;
-    CU_ASSERT(cuDeviceGetAttribute(&numSm, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev));
-    dim3 gridDim(numSm, 1, 1);
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
     dim3 blockDim(numThreadPerBlock, 1, 1);
-    patternCheckKernel<read> <<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount);
+    patternCheckKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount, groupSize, multiplier);
     CUDA_ASSERT(cudaPeekAtLastError());
     CU_ASSERT(cuStreamSynchronize(stream));
 
@@ -285,12 +299,16 @@ unsigned long long checkBufferGeneric(void *ptr, int seed, size_t size, CUstream
     return errorCountCopy;
 }
 
-unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream) {
-    return checkBufferGeneric<read_from_regular_memory>(ptr, seed, size, stream);
-}
-
-unsigned long long checkBufferMulticast(void *ptr, int seed, size_t size, CUstream stream) {
-    return checkBufferGeneric<read_from_multicast_memory>(ptr, seed, size, stream);
+unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, int iterations) {
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), 1);
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL) {
+        return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), iterations);
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        return checkBuffer(ptr, seed, size, stream, 1, iterations);
+    } else {
+        return checkBuffer(ptr, seed, size, stream, 1);
+    }
 }
 
 void preloadKernels(int localDevice) {
@@ -298,9 +316,9 @@ void preloadKernels(int localDevice) {
     cudaSetDevice(localDevice);
     cudaFuncGetAttributes(&unused, &stridingMemcpyKernel<uint, write_to_multicast_memory<uint> >);
     cudaFuncGetAttributes(&unused, &stridingMemcpyKernel<uint4, write_to_regular_memory<uint4> >);
+    cudaFuncGetAttributes(&unused, &simpleMemcpyKernel<uint, reduce_from_multicast_ld_reduce<uint> >);
+    cudaFuncGetAttributes(&unused, &simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> >);
     cudaFuncGetAttributes(&unused, &spinKernelDeviceMultistage);
-    cudaFuncGetAttributes(&unused, &patternFillKernel<write_to_regular_memory>);
-    cudaFuncGetAttributes(&unused, &patternFillKernel<write_to_multicast_memory>);
-    cudaFuncGetAttributes(&unused, &patternCheckKernel<read_from_regular_memory>);
-    cudaFuncGetAttributes(&unused, &patternCheckKernel<read_from_multicast_memory>);
+    cudaFuncGetAttributes(&unused, &patternFillKernel);
+    cudaFuncGetAttributes(&unused, &patternCheckKernel);
 }

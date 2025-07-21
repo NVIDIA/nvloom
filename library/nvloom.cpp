@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,11 +27,28 @@
 #define NVML_NO_UNVERSIONED_FUNC_DEFS
 #include <nvml.h>
 
+auto getCopiesWithUniqueSources(std::vector<Copy> copies) {
+    auto comp = [](Copy a, Copy b) {return a.src.get() < b.src.get();};
+    std::set<Copy, decltype(comp) > uniqueSources(comp);
+    for (auto &copy : copies) {
+        uniqueSources.insert(copy);
+    }
+    return uniqueSources;
+}
+
+auto getCopiesWithUniqueDestinations(std::vector<Copy> copies) {
+    auto comp = [](Copy a, Copy b) {return a.dst.get() < b.dst.get();};
+    std::set<Copy, decltype(comp) > uniqueDestinations(comp);
+    for (auto &copy : copies) {
+        uniqueDestinations.insert(copy);
+    }
+    return uniqueDestinations;
+}
+
 std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     if (copies.size() == 0) {return {};};
 
     std::vector<double> results;
-    int iterCount = 16;
 
     std::vector<Copy> filteredCopies;
     for (auto copy : copies) {
@@ -44,6 +61,7 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     std::vector<CUevent> filteredStartEvents(filteredCopies.size());
     std::vector<CUevent> filteredEndEvents(filteredCopies.size());
     std::vector<double> filteredBandwidths(filteredCopies.size());
+    std::vector<int> filteredExecutedIterations(filteredCopies.size());
 
     AllocationPool<HostMemoryAllocation> blockingVarHost(sizeof(int), copies[0].executingMPIrank);
     AllocationPool<MultinodeMemoryAllocationUnicast> blockingVarDevice(sizeof(int), copies[0].executingMPIrank);
@@ -62,10 +80,12 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     }
 
     // fill buffers
-    for (int i = 0; i < copies.size(); i++) {
-        Copy &copy = copies[i];
-        copy.src->memset(copy.src->uniqueId);
-        copy.dst->memset(copy.dst->uniqueId);
+    for (auto &copy: getCopiesWithUniqueSources(copies)) {
+        copy.src->memset(copy.src->uniqueId, copy.copyType, MemoryPurpose::MEMORY_SOURCE);
+    }
+
+    for (auto &copy: getCopiesWithUniqueDestinations(copies)) {
+        copy.dst->memset(copy.dst->uniqueId, copy.copyType, MemoryPurpose::MEMORY_DESTINATION);
     }
 
     // Make sure all buffers are memseted before proceeding
@@ -75,7 +95,7 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     // warmup
     for (int i = 0; i < filteredCopies.size(); i++) {
         Copy &copy = filteredCopies[i];
-        doMemcpy(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], 1);
+        doMemcpy(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], WARMUP_ITERATIONS);
     }
 
     // block streams
@@ -89,8 +109,10 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     for (int i = 0; i < filteredCopies.size(); i++) {
         Copy &copy = filteredCopies[i];
         CU_ASSERT(cuEventRecord(filteredStartEvents[i], filteredStreams[i]));
-        doMemcpy(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], iterCount);
-        CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+        filteredExecutedIterations[i] = doMemcpyInSpinKernel(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], copy.iterations);
+        if (filteredExecutedIterations[i] == copy.iterations) {
+            CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+        }
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -98,6 +120,28 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     // release work
     if (MPIWrapper::getWorldRank() == copies[0].executingMPIrank) {
         *((int *) (blockingVarHost.ptr)) = 1;
+    }
+
+    int maxIterations = 0;
+    for (auto &copy : filteredCopies) {
+        maxIterations = std::max(maxIterations, copy.iterations);
+    }
+
+    // keep adding copies to streams, one at a time, in a round robin fashion
+    bool pendingWork = true;
+    while (pendingWork) {
+        pendingWork = false;
+        for (int i = 0; i < filteredCopies.size(); i++) {
+            Copy &copy = filteredCopies[i];
+            if (filteredExecutedIterations[i] < copy.iterations) {
+                doMemcpyBeyondSpinKernel(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i]);
+                filteredExecutedIterations[i]++;
+                pendingWork = true;
+            }
+            if (filteredExecutedIterations[i] == copy.iterations) {
+                CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+            }
+        }
     }
 
     // Make sure all the work is finished
@@ -109,12 +153,12 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
         float elapsedMs;
         CU_ASSERT(cuEventElapsedTime(&elapsedMs, filteredStartEvents[i], filteredEndEvents[i]));
 
-        filteredBandwidths[i] = filteredCopies[i].src->allocationSize * iterCount / (1000 * 1000 * elapsedMs);
+        filteredBandwidths[i] = filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000 * 1000 * elapsedMs);
     }
 
     // verify buffers
-    for (auto &copy: copies) {
-        ASSERT(0 == copy.dst->check(copy.src->uniqueId));
+    for (auto &copy: getCopiesWithUniqueDestinations(copies)) {
+        ASSERT(0 == copy.dst->check(copy.src->uniqueId, copy.copyType, WARMUP_ITERATIONS + copy.iterations));
     }
 
     // exchange bandwidths
@@ -148,6 +192,39 @@ void NvLoom::doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_
         copyKernel(dst, src, byteCount, hStream, loopCount);
     } else if (copyType == COPY_TYPE_MULTICAST_WRITE) {
         copyKernelMulticast(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRed(dst, src, byteCount, hStream, loopCount);
+    } else {
+        ASSERT(0);
+    }
+}
+
+unsigned long long NvLoom::doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount) {
+    if (copyType == COPY_TYPE_CE) {
+        // We're only launching 128 iterations in the spinLock guarded loop to avoid possibility of a deadlock
+        loopCount = std::min(loopCount, (unsigned long long) 128);
+        for (int iter = 0; iter < loopCount; iter++) {
+            CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
+        }
+    } else if (copyType == COPY_TYPE_SM) {
+        copyKernel(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_MULTICAST_WRITE) {
+        copyKernelMulticast(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
+        copyKernelMulticastRed(dst, src, byteCount, hStream, loopCount);
+    } else {
+        ASSERT(0);
+    }
+    return loopCount;
+}
+
+void NvLoom::doMemcpyBeyondSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
+    if (copyType == COPY_TYPE_CE) {
+        CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
     }
 }
 
@@ -249,6 +326,8 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
     CU_ASSERT(cuCtxSetCurrent(localCtx));
 
     CU_ASSERT(cuDeviceGetAttribute(&localCpuNumaNode, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, localCuDevice));
+    CU_ASSERT(cuDeviceGetAttribute(&localMultiprocessorCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, localCuDevice));
+    CU_ASSERT(cuDeviceGetAttribute(&localClockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, localCuDevice));
 
     localHostname = getHostname();
 

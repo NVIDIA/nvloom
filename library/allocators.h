@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 
 #include <map>
 #include "kernels.cuh"
+#include "enums.h"
 #include "nvloom.h"
 
 class MemoryAllocation {
@@ -46,8 +47,10 @@ public:
         return "N/A";
     }
 
-    virtual void memset(int value);
-    virtual unsigned long long check(int value);
+    // copyType and memoryPurpose are optional arguments, and are only used in multicast reduction benchmarks
+    virtual void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE);
+    // copyType and iterations are optional arguments, and are only used in multicast reduction benchmarks
+    virtual unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0);
 };
 
 class DeviceMemoryAllocation : public MemoryAllocation {
@@ -105,7 +108,32 @@ public:
     }
 };
 
-class MultinodeMemoryAllocationMulticast : public MemoryAllocation {
+class MultinodeMemoryAllocationMulticastRef : public MemoryAllocation {
+public:
+    void *unicastMappingPtr = nullptr;
+
+    MultinodeMemoryAllocationMulticastRef() = default;
+    MultinodeMemoryAllocationMulticastRef(void *_ptr, void *_unicastMappingPtr, size_t _allocationSize, int _MPIrank){
+        ptr = _ptr;
+        allocationSize = _allocationSize;
+        MPIrank = _MPIrank;
+        unicastMappingPtr = _unicastMappingPtr;
+    };
+    ~MultinodeMemoryAllocationMulticastRef(){};
+
+    static bool filter();
+    static std::string getName() {
+        return "multicast";
+    }
+
+    virtual void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE);
+    virtual unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0);
+
+    // Only used for multicast pool
+    static void setCapacityHint(int _) {};
+};
+
+class MultinodeMemoryAllocationMulticast : public MultinodeMemoryAllocationMulticastRef {
 private:
     CUmemGenericAllocationHandle handle = {};
     CUmemGenericAllocationHandle multicastHandle = {};
@@ -114,19 +142,49 @@ private:
     CUmulticastObjectProp multicastProp = {};
     CUmemAccessDesc desc = {};
     size_t roundedUpAllocationSize;
-    void *unicastMappingPtr = nullptr;
 
 public:
     MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank);
     ~MultinodeMemoryAllocationMulticast();
     CUresult tryAllocation(size_t _allocationSize, int _MPIrank);
-    static bool filter();
-    static std::string getName() {
-        return "multicast";
-    }
+};
 
-    virtual void memset(int value);
-    virtual unsigned long long check(int value);
+class MultinodeMemoryPoolAllocationBase : public MemoryAllocation {
+private:
+    static inline bool devicePoolsInitialized;
+    static inline bool egmPoolsInitialized;
+    static inline std::vector<CUmemoryPool> device_pools;
+    static inline std::vector<CUmemoryPool> egm_pools;
+    std::vector<CUmemFabricHandle> fh_vector;
+    CUmemLocationType mem_location;
+    CUmemPoolProps poolProps = { };
+    CUmemAllocationHandleType handleType = {};
+    CUmemPoolPtrExportData data;
+    CUmemAccessDesc desc = {};
+public:
+    MultinodeMemoryPoolAllocationBase(size_t _allocationSize, int _MPIrank, CUmemLocationType location);
+    virtual ~MultinodeMemoryPoolAllocationBase();
+    virtual std::vector<CUmemoryPool> initPoolsLazy();
+};
+
+class MultinodeMemoryPoolAllocationUnicast : public MultinodeMemoryPoolAllocationBase {
+public:
+    MultinodeMemoryPoolAllocationUnicast(size_t _allocationSize, int _MPIrank) : MultinodeMemoryPoolAllocationBase(_allocationSize, _MPIrank, CU_MEM_LOCATION_TYPE_DEVICE) {};
+    static bool filter();
+
+    static std::string getName() {
+        return "device";
+    }
+};
+
+class MultinodeMemoryPoolAllocationEGM : public MultinodeMemoryPoolAllocationBase {
+public:
+    MultinodeMemoryPoolAllocationEGM(size_t _allocationSize, int _MPIrank) : MultinodeMemoryPoolAllocationBase(_allocationSize, _MPIrank, CU_MEM_LOCATION_TYPE_HOST_NUMA) {};
+    static bool filter();
+
+    static std::string getName() {
+        return "egm";
+    }
 };
 
 template<class T>
@@ -143,12 +201,34 @@ public:
 
     static std::string getName();
 
-    void memset(int value) {current->memset(value);}
-    unsigned long long check(int value) {return current->check(value);}
+    void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE) {current->memset(value, copyType, memoryPurpose);}
+    unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0) {return current->check(value, copyType, iterations);}
+};
+
+class MulticastPool : public MemoryAllocation {
+private:
+    static inline std::multimap<size_t,
+        std::pair<std::shared_ptr<MultinodeMemoryAllocationMulticast>, int> > pool;
+    static const int defaultInsertCount = 1;
+    static inline int insertCount = defaultInsertCount;
+    std::unique_ptr<MultinodeMemoryAllocationMulticastRef> current;
+    std::shared_ptr<MultinodeMemoryAllocationMulticast> parent;
+    int offset;
+public:
+    static void setCapacityHint(int _insertCount) {insertCount = _insertCount;}
+    MulticastPool(size_t _allocationSize, int _MPIrank);
+    ~MulticastPool();
+
+    static void clear();
+    static bool filter();
+
+    static std::string getName();
+
+    void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE) {current->memset(value, copyType, memoryPurpose);}
+    unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0) {return current->check(value, copyType, iterations);}
 };
 
 template class AllocationPool<MultinodeMemoryAllocationUnicast>;
-template class AllocationPool<MultinodeMemoryAllocationMulticast>;
 template class AllocationPool<MultinodeMemoryAllocationEGM>;
 template class AllocationPool<HostMemoryAllocation>;
 
