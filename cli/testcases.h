@@ -23,13 +23,28 @@
 
 extern bool richOutput;
 extern int gpuToRackSamples;
+extern std::string csvInputFile;
+extern std::string csvOutputFile;
 extern int iterations;
+extern int latencyIterations;
+
+enum CopyCount {
+    COPY_COUNT_UNIDIR = 0,
+    COPY_COUNT_BIDIR,
+};
 
 enum AllocatorStrategy {
     ALLOCATOR_STRATEGY_UNIQUE = 0,
     ALLOCATOR_STRATEGY_REUSE,
     ALLOCATOR_STRATEGY_CUDA_POOLS,
 };
+
+std::string getCopyCountName(CopyCount copyCount);
+CopyCount getCopyCount(std::string name);
+std::string getCopyDirectionName(CopyDirection copyDirection);
+CopyDirection getCopyDirection(std::string name);
+std::string getCopyTypeName(CopyType copyType);
+CopyType getCopyType(std::string name);
 
 class Testcase {
 public:

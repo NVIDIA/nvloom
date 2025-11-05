@@ -192,14 +192,14 @@ def format_heatmap(heatmap: plt.Axes,
     heatmap.tick_params(labelbottom=True, labeltop=True, labelsize=main_heatmap_labelsize)
 
 
-def create_main_heatmap(heatmap: plt.Axes, results: list[list[float]]) -> None:
+def create_main_heatmap(heatmap: plt.Axes, results: list[list[float]], unit: str) -> None:
     im = heatmap.imshow(results, cmap="YlGn")
     # set heatmap color limits
     im.set_clim(ARGS.heatmap_lower_limit, ARGS.heatmap_upper_limit)
 
     cbar = heatmap.figure.colorbar(im, ax=heatmap)
     cbar.ax.tick_params(labelsize=ARGS.legend_fontsize)
-    cbar.ax.set_ylabel("GB/s", rotation=-90, va="bottom", labelpad=20, fontsize=ARGS.legend_fontsize)
+    cbar.ax.set_ylabel(unit, rotation=-90, va="bottom", labelpad=20, fontsize=ARGS.legend_fontsize)
 
 
 def plot_result(name: str,
@@ -209,7 +209,8 @@ def plot_result(name: str,
                 columns_separators: list[int],
                 row_separators: list[int],
                 rack_guids: list[str],
-                path: pathlib.Path) -> None:
+                path: pathlib.Path,
+                unit: str) -> None:
     # printing testcase name to show progress in console output
     print(f"Plotting {name}")
 
@@ -223,7 +224,7 @@ def plot_result(name: str,
     validate_limits(min_value, max_value)
 
     fig, (heatmap, stats) = plt.subplots(2, 1, gridspec_kw={"height_ratios": [math.sqrt(len(labels_y)), 1]})
-    create_main_heatmap(heatmap, results)
+    create_main_heatmap(heatmap, results, unit)
 
     fontsize = get_data_fontsize(results)
 
@@ -304,6 +305,12 @@ def enrich_labels_y(labels_y: list[str], process_to_gpu_list: list[str]) -> list
     return labels_y
 
 
+def parse_unit(line: str) -> str:
+    if len(line.split()) < 4:
+        return "GB/s"
+    return line.split()[3]
+
+
 def main() -> None:
     # where to draw lines between rows to indicate different racks
     row_separators = []
@@ -344,11 +351,16 @@ def main() -> None:
 
             labels_y = []
             results = []
-            while not lines[current_line].startswith("MinBW") and not len(lines[current_line].split()) == 0:
+            while not lines[current_line].startswith("Min") and not len(lines[current_line].split()) == 0:
                 result_values, label_y = parse_result_line(lines[current_line])
                 results.append(result_values)
                 labels_y.append(label_y)
                 current_line += 1
+
+            while not lines[current_line].startswith("Min"):
+                current_line += 1
+
+            unit = parse_unit(lines[current_line])
 
             labels_y = enrich_labels_y(labels_y, process_to_gpu_list)
 
@@ -360,7 +372,8 @@ def main() -> None:
                             columns_separators,
                             row_separators,
                             rack_guid_list,
-                            path)
+                            path,
+                            unit)
             except Exception as e:
                 print(f"Error plotting {name} heatmap: {e}")
 

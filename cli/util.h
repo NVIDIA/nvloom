@@ -22,6 +22,8 @@
 #include <vector>
 #include <algorithm>
 #include <iomanip>
+#include <string>
+#include <cctype>
 
 // returns which GPU should this process run on
 int discoverRanks(std::map<std::string, std::vector<int>> &rackToProcessMap);
@@ -44,6 +46,7 @@ private:
     std::vector<std::string> labelsY;
     std::vector<int> columnSeparators;
     Buffering buffering;
+    std::string unit;
 
     void fillLabels(std::vector<std::string>& vec, int size) {
         for (int i = 0; i < size; i++) {
@@ -54,7 +57,7 @@ private:
     void incrementalPrint(int stage);
 
 public:
-    OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED) : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering) {
+    OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED, std::string _unit = "GB/s") : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering), unit(_unit) {
         fillLabels(labelsX, dimX);
         fillLabels(labelsY, dimY);
     }
@@ -75,20 +78,20 @@ public:
 
         if (filteredData.size() == 0) {
             OUTPUT << std::endl;
-            OUTPUT << "MinBW " << name << " N/A GB/s" << std::endl;
-            OUTPUT << "AvgBW " << name << " N/A GB/s" << std::endl;
-            OUTPUT << "MaxBW " << name << " N/A GB/s" << std::endl;
-            OUTPUT << "TotalBW " << name << " N/A GB/s" << std::endl;
+            OUTPUT << "Min " << name << " N/A " << unit << std::endl;
+            OUTPUT << "Avg " << name << " N/A " << unit << std::endl;
+            OUTPUT << "Max " << name << " N/A " << unit << std::endl;
+            OUTPUT << "Total " << name << " N/A " << unit << std::endl;
             OUTPUT << std::endl;
         } else {
             auto sum = std::reduce(filteredData.begin(), filteredData.end());
             auto [min, max] = std::minmax_element(filteredData.begin(), filteredData.end());
             OUTPUT << std::endl;
             OUTPUT << std::fixed << std::setprecision(2);
-            OUTPUT << "MinBW " << name << " " << *min << " GB/s" << std::endl;
-            OUTPUT << "AvgBW " << name << " " << sum / filteredData.size() << " GB/s" << std::endl;
-            OUTPUT << "MaxBW " << name << " " << *max << " GB/s" << std::endl;
-            OUTPUT << "TotalBW " << name << " " << sum << " GB/s" << std::endl;
+            OUTPUT << "Min " << name << " " << *min << " " << unit << std::endl;
+            OUTPUT << "Avg " << name << " " << sum / filteredData.size() << " " << unit << std::endl;
+            OUTPUT << "Max " << name << " " << *max << " " << unit << std::endl;
+            OUTPUT << "Total " << name << " " << sum << " " << unit << std::endl;
             OUTPUT << std::endl;
         }
     }
@@ -144,5 +147,21 @@ static std::vector<T> getKeys(const std::map<T, U> &map) {
     }
     return keys;
 }
+
+static inline std::string trimWhitespace(std::string s) {
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char c) {return !std::isspace(c);}));
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char c) {return !std::isspace(c);}).base(), s.end());
+    return s;
+}
+
+static inline std::string toLower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return std::tolower(c);
+    });
+    return s;
+}
+
+std::string getDriverVersion();
+std::string getCudaVersion();
 
 #endif  // UTIL_H_

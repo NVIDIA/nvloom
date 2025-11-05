@@ -32,6 +32,7 @@ enum CopyType {
     COPY_TYPE_MULTICAST_RED_SINGLE,
     // All GPUs executing multimem.red instructions (multicast_all_to_all)
     COPY_TYPE_MULTICAST_RED_ALL,
+    COPY_TYPE_LATENCY,
 };
 
 enum MemoryPurpose {

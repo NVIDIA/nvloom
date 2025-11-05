@@ -16,8 +16,6 @@
  */
 
 #include <cuda.h>
-#include <chrono>
-#include <thread>
 #include "error.h"
 #include "kernels.cuh"
 #include "nvloom.h"
@@ -131,6 +129,8 @@ MultinodeMemoryAllocationBase::~MultinodeMemoryAllocationBase() {
     CU_ASSERT(cuMemUnmap((CUdeviceptr) ptr, roundedUpAllocationSize));
     CU_ASSERT(cuMemRelease(handle));
     CU_ASSERT(cuMemAddressFree((CUdeviceptr) ptr, roundedUpAllocationSize));
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 bool MultinodeMemoryAllocationUnicast::filter() {
@@ -145,7 +145,7 @@ bool MultinodeMemoryAllocationEGM::filter() {
     return pi != 0;
 };
 
-CUresult MultinodeMemoryAllocationMulticast::tryAllocation(size_t _allocationSize, int _MPIrank) {
+MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank) {
     handleType = CU_MEM_HANDLE_TYPE_FABRIC;
     multicastProp.numDevices = MPIWrapper::getWorldSize();
     multicastProp.handleTypes = handleType;
@@ -181,27 +181,7 @@ CUresult MultinodeMemoryAllocationMulticast::tryAllocation(size_t _allocationSiz
     prop.requestedHandleTypes = handleType;
     CU_ASSERT(cuMemCreate(&handle, roundedUpAllocationSize, &prop, 0 /*flags*/));
 
-    auto error = cuMulticastBindMem(multicastHandle, 0, handle, 0, roundedUpAllocationSize, 0);
-    uint8_t earlyReturn = 0;
-    if (error == CUDA_ERROR_SYSTEM_NOT_READY) {
-        earlyReturn = 1;
-    }
-
-    uint8_t reducedEarlyReturn = 0;
-    MPI_Allreduce(&earlyReturn, &reducedEarlyReturn, 1, MPI_BYTE, MPI_MAX, MPI_COMM_WORLD);
-
-    if (reducedEarlyReturn > 0) {
-        if (error != CUDA_ERROR_SYSTEM_NOT_READY) {
-            CU_ASSERT(cuMulticastUnbind(multicastHandle, NvLoom::getLocalCuDevice(), 0, roundedUpAllocationSize));
-        }
-
-        CU_ASSERT(cuMemRelease(handle));
-        CU_ASSERT(cuMemRelease(multicastHandle));
-
-        return CUDA_ERROR_SYSTEM_NOT_READY;
-    }
-
-    CU_ASSERT(error);
+    CU_ASSERT(cuMulticastBindMem(multicastHandle, 0, handle, 0, roundedUpAllocationSize, 0));
 
     // Map the memory - unicast
     CU_ASSERT(cuMemAddressReserve((CUdeviceptr *) &unicastMappingPtr, roundedUpAllocationSize, 0, 0 /*baseVA*/, 0 /*flags*/));
@@ -224,28 +204,6 @@ CUresult MultinodeMemoryAllocationMulticast::tryAllocation(size_t _allocationSiz
 
     // Make sure that everyone is done with mapping the fabric allocation
     MPI_Barrier(MPI_COMM_WORLD);
-    return CUDA_SUCCESS;
-}
-
-
-MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank) {
-    auto error = tryAllocation(_allocationSize, _MPIrank);
-
-    if (error == CUDA_ERROR_SYSTEM_NOT_READY) {
-        int totalTimeWaited = 0;
-
-        while ((error == CUDA_ERROR_SYSTEM_NOT_READY) && (totalTimeWaited < 60)) {
-            int retryTimeout = 15;
-            totalTimeWaited += retryTimeout;
-
-            if (MPIWrapper::getWorldRank() == 0) {
-                std::cerr << "sleeping for " << retryTimeout << " seconds before retrying allocating multicast memory, total wait: " << totalTimeWaited << std::endl;
-            }
-
-            std::this_thread::sleep_for(std::chrono::seconds(retryTimeout));
-            error = tryAllocation(_allocationSize, _MPIrank);
-        }
-    }
 }
 
 MultinodeMemoryAllocationMulticast::~MultinodeMemoryAllocationMulticast() {
@@ -258,6 +216,8 @@ MultinodeMemoryAllocationMulticast::~MultinodeMemoryAllocationMulticast() {
     CU_ASSERT(cuMemUnmap((CUdeviceptr) ptr, roundedUpAllocationSize));
     CU_ASSERT(cuMemRelease(multicastHandle));
     CU_ASSERT(cuMemAddressFree((CUdeviceptr) ptr, roundedUpAllocationSize));
+
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 void MultinodeMemoryAllocationMulticastRef::memset(int value, CopyType copyType, MemoryPurpose memoryPurpose) {
@@ -364,6 +324,8 @@ MultinodeMemoryPoolAllocationBase::MultinodeMemoryPoolAllocationBase(size_t _all
 }
 
 MultinodeMemoryPoolAllocationBase::~MultinodeMemoryPoolAllocationBase() {
+    MPI_Barrier(MPI_COMM_WORLD);
+
     CU_ASSERT(cuStreamSynchronize(CU_STREAM_PER_THREAD));
 
     if (MPIrank != MPIWrapper::getWorldRank()) {

@@ -37,6 +37,7 @@ set(src
     cli/nvloom_cli.cpp
     cli/util.cpp
     cli/testcases.cpp
+    cli/csv_testcase.cpp
     library/allocators.cpp
     library/nvloom.cpp
     library/kernels.cu

@@ -19,8 +19,10 @@
 #include "error.h"
 #include "nvloom.h"
 #include <curand_kernel.h>
+#include <cuda/ptx>
+#include <algorithm>
 
-const unsigned int numThreadPerBlock = 512;
+constexpr unsigned int numThreadPerBlock = 512;
 
 template<typename T>
 using write_to_memory = void (*)(T*, T);
@@ -244,6 +246,8 @@ void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType co
         } else {
             zeroOutBuffer(ptr, size, stream);
         }
+    } else if (copyType == COPY_TYPE_LATENCY) {
+        pointerChaseFill(ptr, size, stream);
     } else {
         memsetBuffer(ptr, seed, size, stream, 0, 1);
     }
@@ -306,9 +310,81 @@ unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream
         return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), iterations);
     } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
         return checkBuffer(ptr, seed, size, stream, 1, iterations);
+    } else if (copyType == COPY_TYPE_LATENCY) {
+        // Latency measurement is read-only, so there's nothing to verify
+        return 0;
     } else {
         return checkBuffer(ptr, seed, size, stream, 1);
     }
+}
+
+__global__ void pointerChaseFillKernel(size_t* dst, size_t bufferSize) {
+    unsigned long long threadId = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t totalThreadCount = gridDim.x * blockDim.x;
+    char* dstEnd = ((char *) dst) + bufferSize;
+    dst += threadId;
+
+    while ((char *) dst < dstEnd) {
+        *dst = LATENCY_JUMP_SIZE;
+        dst += totalThreadCount;
+    }
+}
+
+void pointerChaseFill(void *ptr, size_t size, CUstream stream) {
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 blockDim(numThreadPerBlock, 1, 1);
+    pointerChaseFillKernel<<<gridDim, blockDim, 0, stream>>>((size_t *)ptr, size);
+    CUDA_ASSERT(cudaPeekAtLastError());
+}
+
+__global__ void pointerChaseKernel(size_t* dst, unsigned long long iterations, size_t offset, int targetBlock) {
+    if (cuda::ptx::get_sreg_smid() != targetBlock) {
+        return;
+    }
+
+    size_t *ptr = (size_t *) ((char *) dst + offset);
+    for (unsigned long long i = 0; i < iterations; i++) {
+        ptr = (size_t *) ((char *) ptr + *ptr);
+    }
+
+    if (ptr == 0) {
+        __trap();
+    }
+}
+
+void pointerChase(CUdeviceptr ptr, size_t size, unsigned long long iterations, size_t previouslyExecutedIterations, int targetBlock, CUstream stream) {
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 blockDim(1, 1, 1);
+    pointerChaseKernel<<<gridDim, blockDim, 0, stream>>>((size_t *)ptr, iterations, previouslyExecutedIterations * LATENCY_JUMP_SIZE, targetBlock);
+    CUDA_ASSERT(cudaPeekAtLastError());
+}
+
+__global__ void getSmIdsKernel(int* smIds) {
+    smIds[blockIdx.x] = cuda::ptx::get_sreg_smid();
+}
+
+std::vector<int> getSmIds() {
+    // we can't use NvLoom::getLocalMultiprocessorCount() here because this function is called during NvLoom::initialize()
+    int smCount;
+    CU_ASSERT(cuDeviceGetAttribute(&smCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, NvLoom::getLocalDevice()));
+
+    std::vector<int> smIds(smCount);
+    int *smIdsDevice;
+    CU_ASSERT(cuMemAlloc((CUdeviceptr *) &smIdsDevice, sizeof(int) * smCount));
+    CU_ASSERT(cuMemsetD8((CUdeviceptr) smIdsDevice, 0, sizeof(int) * smCount));
+
+    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 blockDim(1, 1, 1);
+    getSmIdsKernel<<<gridDim, blockDim>>>(smIdsDevice);
+    CUDA_ASSERT(cudaPeekAtLastError());
+    CU_ASSERT(cuCtxSynchronize());
+
+    CU_ASSERT(cuMemcpy((CUdeviceptr) smIds.data(), (CUdeviceptr) smIdsDevice, sizeof(int) * smCount));
+    CU_ASSERT(cuMemFree((CUdeviceptr) smIdsDevice));
+
+    std::sort(smIds.begin(), smIds.end());
+
+    return smIds;
 }
 
 void preloadKernels(int localDevice) {
@@ -319,6 +395,14 @@ void preloadKernels(int localDevice) {
     cudaFuncGetAttributes(&unused, &simpleMemcpyKernel<uint, reduce_from_multicast_ld_reduce<uint> >);
     cudaFuncGetAttributes(&unused, &simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> >);
     cudaFuncGetAttributes(&unused, &spinKernelDeviceMultistage);
+    cudaFuncGetAttributes(&unused, &pointerChaseFillKernel);
+    cudaFuncGetAttributes(&unused, &pointerChaseKernel);
     cudaFuncGetAttributes(&unused, &patternFillKernel);
     cudaFuncGetAttributes(&unused, &patternCheckKernel);
+    cudaFuncGetAttributes(&unused, &getSmIdsKernel);
+}
+
+// This utility function has to be defined in a .cu file because it uses nvcc compiler macros
+std::string getNvccVersion() {
+    return std::to_string(__CUDACC_VER_MAJOR__) + "." + std::to_string(__CUDACC_VER_MINOR__);
 }

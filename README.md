@@ -56,11 +56,12 @@ Current suites:
 5. `egm` - typical O(n^2) pairwise testing for EGM
 6. `gpu-to-rack` - for each GPU bandwidth is measured against a constant number of peer GPUs. Those GPUs are selected in a randomized manner. Median is reported. If one GPU has a slower connection to the fabric, it will show up on all its benchmarks, but it should have minimal impact on measurement of other GPUs. This is designed to replicate data from typical pairwise benchmarks, but in linear runtime.
 7. `rack-to-rack`. This suite focuses on benchmarking rack-to-rack communication, pushing as many simultaneous copies as possible.
+
 Build it with
 
 `cmake . && make -j`
 
-Run the `nvloom_cli` executable with MPI.
+Run the `nvloom_cli` executable with MPI. You want one launch process per GPU. For example: if you are benchmarking 72 GPU GB200 MNNVL domain, you want to launch 4 processes on each of 18 nodes, adding up to 72 total processes.
 
 To run a single suite of tests:
 
@@ -77,6 +78,18 @@ You can get a list of current testcases with
 Running `nvloom_cli` without arguments will run all testcases available. We recommend against it, instead run appropriate testcases or suites targeting your needs. Nvloom contains a very broad variety of benchmarks, and running every single one might not be an optimal use of time.
 
 For a detailed description of all the CLI options, see [testcase reference](#testcase-reference).
+
+### Docker container
+
+A sample container definition is provided in the Dockerfile file. To build it, run
+
+`docker buildx build . -t nvloom`
+
+Note that this is only a sample, and you likely want to customize it for your needs.
+
+You can run the built images using container runtimes such as [enroot](https://github.com/NVIDIA/enroot).
+
+You don't need to run nvloom in a container.
 
 # How to benchmark MNNVL domains
 
@@ -195,6 +208,12 @@ The `--duration` option allows you to specify how long (in seconds) each testcas
 Controlled with `-d` or `--duration` option.
 
 **Note:** You cannot specify both `--duration` and `--repeat` at the same time; only one of these options can be used per run. If neither is specified, each testcase will run once (the default).
+
+## --enableProfiling
+
+The `--enableProfiling` option disables the use of spinkernels during copy operations. It is intended to be used when running under profilers such as Nsight Compute. This may reduce accuracy of performance results due to the lack of spinkernel synchronization.
+
+Spinkernels will not be launched, but spinkernels-related memory allocations and memsets will still occur to minimize the changes in behavior.
 
 # Heatmap plotter
 
@@ -394,3 +413,137 @@ Each measurement in multicast_all_to_one_red performs a sum of data residing on 
 
 Multicast_all_to_all measures bandwidth of every single GPU reducing data from every single GPU at the same time. In essence, it's `NUM_GPU` of `Multicast_all_to_all_ld_reduce` running simultaneously.
 
+# CSV testcase
+
+CSV testcase allows the user to run an arbitrary communication pattern benchmark, defined by a text file, and not requiring any code changes nor recompilation.
+
+## Input file
+Controlled with `--csvInputFile` parameter.
+
+The input file is a plain CSV file with columns deliminated by commas. Outside of the "comment" parameter, any whitespace is discarded, and everything is converted to lower case before parsing.
+
+This file must be available to all processes.
+
+## Output file
+Controlled with `--csvOutputFile` parameter.
+
+Output of the testcase will be saved to a given file by MPI rank 0.
+
+Input and output file parameter can point to the same file. In this case, the input file will be overriden with the output.
+
+The generated output file can be used as an input file for another benchmark run.
+
+## Concurrent benchmarks
+
+Be careful when scheduling multiple benchmarks to be executed by the same GPU. Don't schedule two benchmarks using SMs on the same GPU at the same time. For example, you can't concurrently do:
+
+- SM copy and latency benchmark
+- SM copy and multicast operation
+- multicast operation and latency benchmark
+
+Doing a CE copy and SM operation at the same time is permissible.
+
+## CSV format
+
+First line is the header, and is ignored by the CSV parser.
+
+### Example
+
+```csv
+measurement_id, bandwidth/latency, gpu_src_id, gpu_dst_id, iteration_count, mem_src_type, mem_dst_type, write/read, ce/sm/multicast, buffer_size, comment, result [GB/s] [ns]
+0, bandwidth, 0, 1, default, device, egm, write, ce, default, bidir_egm
+0, bandwidth, 1, 0, default, egm, device, read, ce, default, bidir_egm
+1, bandwidth, 0, 1, default, device, device, write, ce, 10000K, unidir_egm
+2, bandwidth, 1, 1, 32, device, device, write, ce, 256M, all_from_one
+2, bandwidth, 2, 1, 32, device, device, write, ce, 256M, all_from_one
+2, bandwidth, 3, 1, 32, device, device, write, ce, 256M, all_from_one
+3, latency, 3, 1, default, device, ignored, ignored, ignored, ignored, latency
+4, bandwidth, 3, 1, default, device, device, write, ce, 1G, latency_under_load
+4, latency, 1, 3, 40000, device, ignored, ignored, ignored, ignored, latency_under_load
+```
+
+### Measurement ID
+
+Each line starts with `measurement_id`. If multiple lines have the same `measurement_id`, those benchmarks will be executed simultaneously. This enables you to write traffic patterns such as bidirectional or all-to-one.
+
+`measurement_id` should start at 0. Beyond repetitions, `measurement_id`s should be consecutive.
+
+Allocation pools (-a/--allocatorStrategy=reuse) will be cleared between each measurement.
+
+### Bandwidth/latency
+
+Each line describes either a "bandwidth" or "latency" operation. Second column should contain either `bandwidth` or `latency`.
+
+Bandwidth line is of format:
+
+measurement_id, BANDWIDTH, gpu_src_id, gpu_dst_id, iteration_count, mem_src_type, mem_dst_type, write/read, ce/sm/multicast, buffer_size, comment
+
+Latency line is of format:
+
+measurement_id, LATENCY, gpu_src_id, exec_gpu_id, iteration_count, mem_src_type, ignored, ignored, ignored, ignored, comment
+
+### Source GPU
+
+MPI rank of the process/GPU where source memory is allocated.
+
+### Destination GPU/executing GPU
+
+For bandwidth, MPI rank of the process/GPU where source memory is allocated.
+
+For latency, MPI rank of the GPU accessing the source memory.
+
+### Iteration count
+
+How many iterations of bandwidth/latency benchmarks to execute. You can specify `default` to get the default iteration count used by nvloom_cli.
+
+### Source memory type
+
+Type of memory for the source buffer. Can be either `device`, `egm` or `multicast`.
+
+Latency tests operate on the source memory buffer, however, only `device` and `egm` are accepted.
+
+### Destination memory type
+
+Type of memory for the destination buffer. Can be either `device`, `egm` or `multicast`.
+
+For latency tests, this parameter is ignored.
+
+### Copy direction: write/read
+
+Whether the test is executed as a "read" (destination GPU executing the copy) or "write" (source GPU executing the copy).
+
+For latency tests, this parameter is ignored.
+
+### Operation type: ce/sm/multicast
+
+How the copy is executed.
+
+For `CE`, the copy is scheduled through `cuMemcpyAsync`.
+
+For `SM`, the copy is executed by a custom memcpy kernel.
+
+For `multicast` the copy is executed by a custom multicast memcpy kernel. In `multicast` case, the source memory has to be either `device` or `egm`, and the destination memory has to be `multicast`. Moreover, the copy type has to be `write`.
+
+Multicast reductions are not supported in the CSV testcase.
+
+For latency tests, this parameter is ignored.
+
+### Buffer size
+
+Size of the buffer to copy, in bytes.
+
+You can also use `k`, `m` and `g` suffixes, meaning `1024`, `1024*1024` and `1024*1024*1024`. For example, `10k` will be evaluated to 10240 bytes.
+
+For latency tests, this parameter is ignored.
+
+### Comment
+
+A string that will be printed out verbatim when outputting results.
+
+## Result
+
+Results are printed out as last column.
+
+For bandwidth testcases, the results are reported in GB/s.
+
+For latency testcases, the results are reported in nanoseconds.

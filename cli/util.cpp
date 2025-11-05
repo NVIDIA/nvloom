@@ -22,6 +22,8 @@
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
+#include <cuda.h>
+#include <nvml.h>
 
 #include "nvloom.h"
 #include "util.h"
@@ -154,4 +156,17 @@ void OutputMatrix::incrementalPrint(int stage) {
     }
 }
 
+std::string getDriverVersion() {
+    NVML_ASSERT(nvmlInit());
+    char driverVersion[NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
+    NVML_ASSERT(nvmlSystemGetDriverVersion(driverVersion, NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE));
+    return driverVersion;
+}
 
+std::string getCudaVersion() {
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    int majorVersion = driverVersion / 1000;
+    int minorVersion = (driverVersion % 1000) / 10;
+    return std::to_string(majorVersion) + "." + std::to_string(minorVersion);
+}

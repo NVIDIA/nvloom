@@ -19,28 +19,43 @@
 #include "nvloom.h"
 #include "util.h"
 #include "testcases.h"
+#include "csv_testcase.h"
 
+#include <algorithm>
+#include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <random>
-#include <algorithm>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <tuple>
 #include <utility>
-
-enum CopyCount {
-    COPY_COUNT_UNIDIR = 0,
-    COPY_COUNT_BIDIR,
-};
+#include <vector>
 
 std::string getCopyCountName(CopyCount copyCount) {
     if (copyCount == COPY_COUNT_UNIDIR) return "unidir";
     if (copyCount == COPY_COUNT_BIDIR) return "bidir";
-    return "";
+    throw std::runtime_error("Invalid copy count");
+}
+
+CopyCount getCopyCount(std::string name) {
+    if (name == "unidir") return COPY_COUNT_UNIDIR;
+    if (name == "bidir") return COPY_COUNT_BIDIR;
+    throw std::runtime_error("Invalid copy count");
 }
 
 std::string getCopyDirectionName(CopyDirection copyDirection) {
     if (copyDirection == COPY_DIRECTION_READ) return "read";
     if (copyDirection == COPY_DIRECTION_WRITE) return "write";
-    return "";
+    throw std::runtime_error("Invalid copy direction");
+}
+
+CopyDirection getCopyDirection(std::string name) {
+    if (name == "read") return COPY_DIRECTION_READ;
+    if (name == "write") return COPY_DIRECTION_WRITE;
+    throw std::runtime_error("Invalid copy direction");
 }
 
 std::string getCopyTypeName(CopyType copyType) {
@@ -48,8 +63,19 @@ std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_SM) return "sm";
     if (copyType == COPY_TYPE_MULTICAST_WRITE) return "mc";
     if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
-    if (copyType == COPY_TYPE_MULTICAST_RED_ALL or copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
-    return "";
+    if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) return "mc_red";
+    if (copyType == COPY_TYPE_LATENCY) return "latency";
+    throw std::runtime_error("Invalid copy type");
+}
+
+CopyType getCopyType(std::string name) {
+    if (name == "ce") return COPY_TYPE_CE;
+    if (name == "sm") return COPY_TYPE_SM;
+    if (name == "mc") return COPY_TYPE_MULTICAST_WRITE;
+    if (name == "mc_ld_reduce") return COPY_TYPE_MULTICAST_LD_REDUCE;
+    if (name == "mc_red") return COPY_TYPE_MULTICAST_RED_ALL;
+    if (name == "latency") return COPY_TYPE_LATENCY;
+    throw std::runtime_error("Invalid copy type");
 }
 
 template <typename dstAllocator, typename srcAllocator, CopyDirection copyDirection, CopyType copyType>
@@ -529,6 +555,37 @@ public:
     }
 };
 
+template <typename allocator>
+class latency : public Testcase {
+public:
+    void run(size_t copySize) {
+        OutputMatrix output(getName(), MPIWrapper::getWorldSize(), MPIWrapper::getWorldSize(), BUFFERING_ENABLED, "ns");
+
+        for (int shift = 1; shift < MPIWrapper::getWorldSize(); shift++) {
+            std::vector<Copy> latencies;
+            for (int executingRank = 0; executingRank < MPIWrapper::getWorldSize(); executingRank++) {
+                int memoryLocation = (executingRank + shift) % MPIWrapper::getWorldSize();
+                latencies.push_back(Latency<allocator>(memoryLocation, executingRank, latencyIterations));
+            }
+
+            auto results = NvLoom::doBenchmark(latencies);
+
+            for (int executingRank = 0; executingRank < results.size(); executingRank++) {
+                int memoryLocation = (executingRank + shift) % MPIWrapper::getWorldSize();
+                output.set(memoryLocation, executingRank, results[executingRank]);
+            }
+        }
+    }
+
+    std::string getName() {
+        return "latency_" + allocator::getName();
+    }
+
+    bool filter() {
+        return allocator::filter();
+    }
+};
+
 static void addTestcase(
         std::map<std::string, std::vector<std::string> > &suites,
         std::string suiteName,
@@ -612,6 +669,13 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
+
+    // csv
+    addTestcase(suites, "csv", testcases, std::make_unique<csv_pattern<unicastAllocator, egmAllocator, multicastAllocator> >());
+
+    // latency
+    addTestcase(suites, "latency", testcases, std::make_unique<latency<unicastAllocator> >());
+    addTestcase(suites, "latency", testcases, std::make_unique<latency<egmAllocator> >());
 
     return {std::move(testcases), std::move(suites)};
 }

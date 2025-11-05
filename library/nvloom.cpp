@@ -95,14 +95,16 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     // warmup
     for (int i = 0; i < filteredCopies.size(); i++) {
         Copy &copy = filteredCopies[i];
-        doMemcpy(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i], WARMUP_ITERATIONS);
+        doMemcpyWarmup(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i]);
     }
 
-    // block streams
-    for (int i = 0; i < filteredCopies.size(); i++) {
-        CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost.ptr : nullptr,
-                                        (volatile int *) blockingVarDevice.ptr,
-                                        filteredStreams[i]));
+    if (spinKernelsEnabled) {
+        // block streams
+        for (int i = 0; i < filteredCopies.size(); i++) {
+            CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost.ptr : nullptr,
+                                            (volatile int *) blockingVarDevice.ptr,
+                                            filteredStreams[i]));
+        }
     }
 
     // schedule work
@@ -137,9 +139,12 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
                 doMemcpyBeyondSpinKernel(copy.copyType, (CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, filteredStreams[i]);
                 filteredExecutedIterations[i]++;
                 pendingWork = true;
-            }
-            if (filteredExecutedIterations[i] == copy.iterations) {
-                CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+
+                // Only record the end event if we scheduled more iterations
+                // Otherwise, we might be re-recording the end event scheduled prior to barrier synchronization
+                if (filteredExecutedIterations[i] == copy.iterations) {
+                    CU_ASSERT(cuEventRecord(filteredEndEvents[i], filteredStreams[i]));
+                }
             }
         }
     }
@@ -152,8 +157,11 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     for (int i = 0; i < filteredCopies.size(); i++) {
         float elapsedMs;
         CU_ASSERT(cuEventElapsedTime(&elapsedMs, filteredStartEvents[i], filteredEndEvents[i]));
-
-        filteredBandwidths[i] = filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000 * 1000 * elapsedMs);
+        if (filteredCopies[i].copyType == COPY_TYPE_LATENCY) {
+            filteredBandwidths[i] = (double) elapsedMs * (double) 1e6 / (double)filteredCopies[i].iterations;
+        } else {
+            filteredBandwidths[i] = filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000 * 1000 * elapsedMs);
+        }
     }
 
     // verify buffers
@@ -183,19 +191,21 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     return results;
 }
 
-void NvLoom::doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount) {
+void NvLoom::doMemcpyWarmup(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream) {
     if (copyType == COPY_TYPE_CE) {
-        for (int iter = 0; iter < loopCount; iter++) {
+        for (int iter = 0; iter < WARMUP_ITERATIONS; iter++) {
             CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
         }
     } else if (copyType == COPY_TYPE_SM) {
-        copyKernel(dst, src, byteCount, hStream, loopCount);
+        copyKernel(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
     } else if (copyType == COPY_TYPE_MULTICAST_WRITE) {
-        copyKernelMulticast(dst, src, byteCount, hStream, loopCount);
+        copyKernelMulticast(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
     } else if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
-        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, loopCount);
+        copyKernelMulticastLdReduce(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
     } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
-        copyKernelMulticastRed(dst, src, byteCount, hStream, loopCount);
+        copyKernelMulticastRed(dst, src, byteCount, hStream, WARMUP_ITERATIONS);
+    } else if (copyType == COPY_TYPE_LATENCY) {
+        pointerChase(src, byteCount, WARMUP_LATENCY_ITERATIONS, 0, 0, hStream);
     } else {
         ASSERT(0);
     }
@@ -203,7 +213,7 @@ void NvLoom::doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_
 
 unsigned long long NvLoom::doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount) {
     if (copyType == COPY_TYPE_CE) {
-        // We're only launching 128 iterations in the spinLock guarded loop to avoid possibility of a deadlock
+        // We're only launching 128 iterations in the spinkernel guarded loop to avoid possibility of a deadlock
         loopCount = std::min(loopCount, (unsigned long long) 128);
         for (int iter = 0; iter < loopCount; iter++) {
             CU_ASSERT(cuMemcpyAsync(dst, src, byteCount, hStream));
@@ -216,6 +226,15 @@ unsigned long long NvLoom::doMemcpyInSpinKernel(CopyType copyType, CUdeviceptr d
         copyKernelMulticastLdReduce(dst, src, byteCount, hStream, loopCount);
     } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_MULTICAST_RED_SINGLE) {
         copyKernelMulticastRed(dst, src, byteCount, hStream, loopCount);
+    } else if (copyType == COPY_TYPE_LATENCY) {
+        auto smIds = NvLoom::getLocalSMIds();
+        unsigned long long iterationsSoFar = WARMUP_LATENCY_ITERATIONS;
+        for (int j = 0; j < smIds.size(); j++) {
+            unsigned long long iterations = loopCount/smIds.size() + (j < loopCount % smIds.size() ? 1 : 0);
+            pointerChase(src, byteCount, iterations, iterationsSoFar, smIds[j], hStream);
+            iterationsSoFar += iterations;
+        }
+        ASSERT(iterationsSoFar == loopCount + WARMUP_LATENCY_ITERATIONS);
     } else {
         ASSERT(0);
     }
@@ -329,6 +348,7 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
     CU_ASSERT(cuDeviceGetAttribute(&localMultiprocessorCount, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, localCuDevice));
     CU_ASSERT(cuDeviceGetAttribute(&localClockRate, CU_DEVICE_ATTRIBUTE_CLOCK_RATE, localCuDevice));
 
+    localSMIds = getSmIds();
     localHostname = getHostname();
 
     preloadKernels(localDevice);

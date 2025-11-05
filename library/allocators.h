@@ -27,13 +27,14 @@ class MemoryAllocation {
 public:
     void *ptr = nullptr;
     size_t allocationSize = 0;
-    int MPIrank = -1;
+    int MPIrank;
     static inline int uniqueIdCounter = 0;
     int uniqueId;
 
-    MemoryAllocation() {
+    MemoryAllocation(int _MPIrank = -1) {
         uniqueId = uniqueIdCounter;
         uniqueIdCounter++;
+        MPIrank = _MPIrank;
     };
 
     ~MemoryAllocation() {};
@@ -146,7 +147,6 @@ private:
 public:
     MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank);
     ~MultinodeMemoryAllocationMulticast();
-    CUresult tryAllocation(size_t _allocationSize, int _MPIrank);
 };
 
 class MultinodeMemoryPoolAllocationBase : public MemoryAllocation {

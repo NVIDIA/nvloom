@@ -24,14 +24,19 @@
 #include <iostream>
 #include <memory>
 
-#define NVLOOM_VERSION "1.2.0"
+#define NVLOOM_VERSION "1.3.0"
 #ifndef GIT_COMMIT
 #define GIT_COMMIT "unknown"
 #endif
 
 bool richOutput = false;
 int gpuToRackSamples = 5;
+std::string csvInputFile;
+std::string csvOutputFile;
 int iterations = NvLoom::getDefaultIterationCount();
+int latencyIterations = NvLoom::getDefaultLatencyIterationCount();
+int bufferSizeInMiB = NvLoom::getDefaultBufferSizeInMiB();
+bool enableProfiling = false;
 
 bool shouldContinue(boost::program_options::variables_map &vm, int iteration, std::chrono::time_point<std::chrono::high_resolution_clock> startTime) {
     if (vm["repeat"].defaulted() && vm["duration"].defaulted()) {
@@ -58,23 +63,26 @@ int run_program(int argc, char **argv) {
     std::string allocatorStrategyString;
 
     bool listTestcases = false;
-    int bufferSizeInMiB = 512;
     int repeat = 1;
     int duration = -1;
 
-    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, egm, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack");
+    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, egm, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency");
     opts.add_options()
         ("help,h", "Produce help message")
         ("bufferSize,b", boost::program_options::value<int>(&bufferSizeInMiB)->default_value(bufferSizeInMiB), "Buffer size in MiB")
+        ("latencyIterations", boost::program_options::value<int>(&latencyIterations)->default_value(latencyIterations), "Number of iterations for latency testcases, must be at least 1024")
         ("testcase,t", boost::program_options::value<std::vector<std::string>>(&testcasesToRun)->multitoken(), "Testcase(s) to run (by name)")
         ("suite,s", boost::program_options::value<std::vector<std::string>>(&suitesToRun)->multitoken(), suitesOptionDescription.c_str())
         ("listTestcases,l", boost::program_options::bool_switch(&listTestcases)->default_value(listTestcases), "List testcases")
         ("richOutput,r", boost::program_options::bool_switch(&richOutput)->default_value(richOutput), "Rich output")
         ("allocatorStrategy,a", boost::program_options::value<std::string>(&allocatorStrategyString)->default_value("reuse"), "Allocator strategy: choose between unique, reuse and cudapool")
         ("gpuToRackSamples", boost::program_options::value<int>(&gpuToRackSamples)->default_value(gpuToRackSamples), "Number of per-rack samples to use in gpu_to_rack testcases")
+        ("csvInputFile", boost::program_options::value<std::string>(&csvInputFile)->default_value(csvInputFile), "CSV input file")
+        ("csvOutputFile", boost::program_options::value<std::string>(&csvOutputFile)->default_value(csvOutputFile), "CSV output file")
         ("iterations,i", boost::program_options::value<int>(&iterations)->default_value(iterations), "Number of copy iterations within the testcase to run, not including the warmup iteration")
         ("repeat,c", boost::program_options::value<int>(&repeat)->default_value(repeat), "Number of times to repeat each testcase")
         ("duration,d", boost::program_options::value<int>(&duration)->default_value(duration), "Duration of each testcase in seconds")
+        ("enableProfiling", boost::program_options::bool_switch(&enableProfiling)->default_value(enableProfiling), "Enable profiling by disabling spinkernels. This may reduce accuracy of performance results.")
         ;
 
     boost::program_options::variables_map vm;
@@ -98,8 +106,17 @@ int run_program(int argc, char **argv) {
         return 1;
     }
 
+    if (latencyIterations < 1024) {
+        std::cerr << "Latency iterations must be at least 1024\n";
+        return 1;
+    }
+
     OUTPUT << "nvloom_cli " << NVLOOM_VERSION << std::endl;
     OUTPUT << "git commit: " << GIT_COMMIT << std::endl;
+
+    OUTPUT << "NVCC version: " << getNvccVersion() << std::endl;
+    OUTPUT << "CUDA version: " << getCudaVersion() << std::endl;
+    OUTPUT << "Driver version: " << getDriverVersion() << std::endl;
 
     AllocatorStrategy allocatorStrategy;
     if (allocatorStrategyString == "reuse"){
@@ -135,6 +152,10 @@ int run_program(int argc, char **argv) {
     std::map<std::string, std::vector<int> > rackToProcessMap;
     int localDevice = discoverRanks(rackToProcessMap);
     NvLoom::initialize(localDevice, rackToProcessMap);
+    if (enableProfiling) {
+        NvLoom::disableSpinKernels();
+    }
+
 
     std::set<std::string> testcasesToRunSet;
 
@@ -173,7 +194,12 @@ int run_program(int argc, char **argv) {
 
             OUTPUT << "Running " << testcaseName << std::endl;
             auto startTime = std::chrono::high_resolution_clock::now();
-            testcases[testcase]->filterRun(bufferSizeInB);
+            try {
+                testcases[testcase]->filterRun(bufferSizeInB);
+            } catch (const std::exception& e) {
+                std::cerr << "Error running testcase " << testcaseName << ": " << e.what() << std::endl;
+                return 1;
+            }
             auto endTime = std::chrono::high_resolution_clock::now();
 
             bool shouldContinueIteration = shouldContinue(vm, iterationCount, loopStartTime);

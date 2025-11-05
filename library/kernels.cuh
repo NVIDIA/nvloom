@@ -19,12 +19,15 @@
 #define KERNELS_CUH_
 
 #include <cuda.h>
+#include <string>
+#include <vector>
 #include "enums.h"
 
 const unsigned long long DEFAULT_SPIN_KERNEL_TIMEOUT_MS = 10000ULL;   // 10 seconds
 
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
 void copyKernelMulticast(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
+void pointerChase(CUdeviceptr ptr, size_t size, unsigned long long iterations, size_t previouslyExecutedIterations, int targetBlock, CUstream stream);
 void copyKernelMulticastLdReduce(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
 void copyKernelMulticastRed(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
 
@@ -34,7 +37,12 @@ unsigned long long checkBuffer(void *ptr, int value, size_t size, CUstream strea
 
 void memsetBuffer(void *ptr, int value, size_t size, CUstream stream, CopyType copyType, MemoryPurpose memoryPurpose);
 void memsetBufferMulticast(void *ptr, int value, size_t size, CUstream stream, CopyType copyType);
+void pointerChaseFill(void *ptr, size_t size, CUstream stream);
 
 void preloadKernels(int localDevice);
+
+std::string getNvccVersion();
+
+std::vector<int> getSmIds();
 
 #endif  // KERNELS_CUH_

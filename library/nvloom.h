@@ -33,6 +33,12 @@
 constexpr unsigned long long WARMUP_ITERATIONS = 1;
 constexpr unsigned long long DEFAULT_ITERATIONS = 16;
 
+constexpr unsigned long long DEFAULT_LATENCY_ITERATIONS = 40000;
+constexpr unsigned long long WARMUP_LATENCY_ITERATIONS = 256;
+constexpr size_t DEFAULT_BUFFER_SIZE_MIB = 512;
+
+constexpr unsigned long long LATENCY_JUMP_SIZE = 128;
+
 class Copy {
 public:
     std::shared_ptr<MemoryAllocation> dst;
@@ -55,6 +61,21 @@ public:
             executingMPIrank = src->MPIrank;
         }
     }
+};
+
+// Latency is a special kind of copy operation
+// The destination MemoryAllocation is an empty allocation, only indicating which node is executing the benchmark
+// The source MemoryAllocation is the memory to which access is being benchmarked
+// We calculate the size of the calculation to fit all the iterations in
+template <typename T>
+class Latency : public Copy {
+public:
+    Latency(int _memoryLocation, int _executingMPIrank, unsigned long long _iterations = DEFAULT_LATENCY_ITERATIONS) :
+        Copy(std::make_shared<MemoryAllocation>(_executingMPIrank),
+             std::make_shared<T>((_iterations + WARMUP_LATENCY_ITERATIONS) * LATENCY_JUMP_SIZE, _memoryLocation),
+             COPY_DIRECTION_READ,
+             COPY_TYPE_LATENCY,
+             _iterations) {}
 };
 
 class MPIWrapper {
@@ -115,9 +136,11 @@ private:
     static inline int localCpuNumaNode;
     static inline std::string localHostname;
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
+    static inline std::vector<int> localSMIds;
+    static inline bool spinKernelsEnabled = true;
 
     // Launch loopCount copy iterations, unconditionally
-    static void doMemcpy(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream, unsigned long long loopCount);
+    static void doMemcpyWarmup(CopyType copyType, CUdeviceptr dst, CUdeviceptr src, size_t byteCount, CUstream hStream);
 
     // Launch up to loopCount iterations, accounting for the spinKernel guarded loop
     // Returns the number of iterations actually launched
@@ -137,11 +160,17 @@ public:
     static int getLocalMultiprocessorCount() { return localMultiprocessorCount; };
     static int getLocalClockRate() { return localClockRate; };
     static int getLocalCpuNumaNode() { return localCpuNumaNode; };
+    static std::vector<int>& getLocalSMIds() { return localSMIds; };
     static std::string getLocalHostname() { return localHostname; };
     static unsigned long long getDefaultIterationCount() { return DEFAULT_ITERATIONS; };
+    static unsigned long long getDefaultLatencyIterationCount() { return DEFAULT_LATENCY_ITERATIONS; };
+    static size_t getDefaultBufferSizeInMiB() { return DEFAULT_BUFFER_SIZE_MIB; };
 
     static std::map<std::string, std::vector<int> > getRackToProcessMap() { return rackToProcessMap; };
     static void initialize(int _localDevice, std::map<std::string, std::vector<int> > _rackToProcessMap = {});
+    // Enable profiling by disabling spinKernels. This may reduce accuracy of performance results.
+    // spinKernels will not be launched, but spinkernel-related memory allocations and memsets will still occur to minimize the changes in behavior.
+    static void disableSpinKernels() { spinKernelsEnabled = false; }
     static void finalize();
 };
 

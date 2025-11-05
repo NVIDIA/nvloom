@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.3.0] - 2025-10-02
+
+### Added
+- CSV defined benchmarks
+- Memory access latency benchmarks
+- Sample Dockerfile to build nvloom
+
+### Changed
+- Retry mechanism for CUDA multicast allocations was removed
+
+### Fixed
+- Freeing MNNVL memory did not have enough MPI barriers, leading to race conditions in extremely rare edge-cases
+- Benchmarking algorithm sometimes would record "end event" twice. This had no impact on benchmark results.
+
 ## [1.2.0] - 2025-07-21
 
 ### Added
