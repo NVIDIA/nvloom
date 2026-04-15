@@ -38,6 +38,11 @@ __device__ void write_to_regular_memory(T *dst, T val) {
     *dst = val;
 }
 
+template<>
+__device__ void write_to_regular_memory<uint4>(uint4 *dst, uint4 val) {
+    *dst = {val.x, val.y, val.z, val.w};
+}
+
 template<typename T>
 __device__ void write_to_multicast_memory(T *dst, T val) {
 #if __CUDA_ARCH__ >= 900
@@ -59,54 +64,36 @@ __device__ void reduce_from_multicast_red(T *dst, T *val) {
 #endif
 }
 
-template<typename T, write_to_memory<T> write>
+template<typename T, write_to_memory<T> write, int UNROLL_FACTOR = 12>
 __global__ void stridingMemcpyKernel(unsigned int totalThreadCount, unsigned long long loopCount, T* dst, T* src, size_t sizeInElement) {
-    T *dstEnd = dst + sizeInElement;
     size_t chunkSizeInElement = sizeInElement / totalThreadCount;
 
     size_t globalThreadId = blockDim.x * blockIdx.x + threadIdx.x;
     dst += globalThreadId;
     src += globalThreadId;
+    size_t maxElementIndex = sizeInElement - globalThreadId;
 
     // Calculate where to end the big pipelined copy
-    size_t bigChunkSizeInElement = chunkSizeInElement / 12;
-    T *dstBigEnd = dst + (bigChunkSizeInElement * 12) * totalThreadCount;
-
+    size_t bigChunkSizeInElement = chunkSizeInElement / UNROLL_FACTOR;
     for (unsigned int i = 0; i < loopCount; i++) {
-        T* cdst = dst;
-        T* csrc = src;
+        for (unsigned long long j = 0; j < bigChunkSizeInElement; j++) {
+            unsigned long long offset = j * UNROLL_FACTOR * totalThreadCount;
 
-        while (cdst < dstBigEnd) {
-            T pipe_0 = *csrc; csrc += totalThreadCount;
-            T pipe_1 = *csrc; csrc += totalThreadCount;
-            T pipe_2 = *csrc; csrc += totalThreadCount;
-            T pipe_3 = *csrc; csrc += totalThreadCount;
-            T pipe_4 = *csrc; csrc += totalThreadCount;
-            T pipe_5 = *csrc; csrc += totalThreadCount;
-            T pipe_6 = *csrc; csrc += totalThreadCount;
-            T pipe_7 = *csrc; csrc += totalThreadCount;
-            T pipe_8 = *csrc; csrc += totalThreadCount;
-            T pipe_9 = *csrc; csrc += totalThreadCount;
-            T pipe_10 = *csrc; csrc += totalThreadCount;
-            T pipe_11 = *csrc; csrc += totalThreadCount;
-
-            write(cdst, pipe_0); cdst += totalThreadCount;
-            write(cdst, pipe_1); cdst += totalThreadCount;
-            write(cdst, pipe_2); cdst += totalThreadCount;
-            write(cdst, pipe_3); cdst += totalThreadCount;
-            write(cdst, pipe_4); cdst += totalThreadCount;
-            write(cdst, pipe_5); cdst += totalThreadCount;
-            write(cdst, pipe_6); cdst += totalThreadCount;
-            write(cdst, pipe_7); cdst += totalThreadCount;
-            write(cdst, pipe_8); cdst += totalThreadCount;
-            write(cdst, pipe_9); cdst += totalThreadCount;
-            write(cdst, pipe_10); cdst += totalThreadCount;
-            write(cdst, pipe_11); cdst += totalThreadCount;
+            T pipe[UNROLL_FACTOR];
+            #pragma unroll
+            for (int k = 0; k < UNROLL_FACTOR; ++k) {
+                pipe[k] = src[offset + k * totalThreadCount];
+            }
+            #pragma unroll
+            for (int k = 0; k < UNROLL_FACTOR; ++k) {
+                write(dst + offset + k * totalThreadCount, pipe[k]);
+            }
         }
 
-        // Take care of copies that didn't get aligned properly
-        while (cdst < dstEnd) {
-            write(cdst, *csrc); cdst += totalThreadCount; csrc += totalThreadCount;
+        // Take care of copies that didn't get aligned properly and remainder elements
+        size_t start_offset = bigChunkSizeInElement * UNROLL_FACTOR * totalThreadCount;
+        for (size_t offset = start_offset; offset < maxElementIndex; offset += totalThreadCount) {
+            write(dst + offset, src[offset]);
         }
     }
 }
