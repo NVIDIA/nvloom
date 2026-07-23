@@ -64,6 +64,11 @@ public:
     virtual void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE);
     // copyType and iterations are optional arguments, and are only used in multicast reduction benchmarks
     virtual unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0);
+
+#if CUDA_VERSION >= 13030
+    virtual CUlogicalEndpointId getEndpointId();
+    virtual size_t getEndpointOffset();
+#endif
 };
 
 class DeviceMemoryAllocation : public MemoryAllocation {
@@ -121,6 +126,71 @@ public:
     }
 };
 
+class MemoryAllocationCFT : public MemoryAllocation {
+protected:
+    CUmemAllocationProp memProp = {};
+    CUmemGenericAllocationHandle handle = {};
+    size_t roundedUpAllocationSize;
+
+#if CUDA_VERSION >= 13030
+    CUlogicalEndpointId endpointId = {};
+#endif
+
+public:
+    MemoryAllocationCFT() {};
+    ~MemoryAllocationCFT() {};
+
+#if CUDA_VERSION >= 13030
+    CUlogicalEndpointId getEndpointId() override {
+        return endpointId;
+    }
+
+    size_t getEndpointOffset() override {
+        return 0;
+    }
+#endif
+
+    size_t getRoundedAllocationSize(size_t _allocationSize);
+    void *allocateMemory(size_t _allocationSize);
+    void freeMemory(void *ptr);
+};
+
+class MultinodeMemoryAllocationUnicastCFT : public MemoryAllocationCFT {
+public:
+    MultinodeMemoryAllocationUnicastCFT(size_t _allocationSize, int _MPIrank);
+    ~MultinodeMemoryAllocationUnicastCFT();
+
+    static bool filter();
+
+    static std::string getName() {
+        return "device";
+    }
+};
+
+class MultinodeMemoryAllocationMulticastCFTRef;
+
+class MultinodeMemoryAllocationMulticastCFT : public MemoryAllocationCFT {
+    void *unicastMappingPtr = nullptr;
+
+public:
+    MultinodeMemoryAllocationMulticastCFT(size_t _allocationSize, int _MPIrank);
+    ~MultinodeMemoryAllocationMulticastCFT();
+
+    static bool filter();
+
+    static std::string getName() {
+        return "multicast";
+    }
+
+    virtual void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE);
+    virtual unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0);
+
+    std::unique_ptr<MultinodeMemoryAllocationMulticastCFTRef> createRef(int chunkIndex, size_t chunkSize, int _MPIrank);
+
+    // Only used for multicast pool
+    static void setCapacityHint(int _) {};
+};
+
 class MultinodeMemoryAllocationMulticastRef : public MemoryAllocation {
 public:
     void *unicastMappingPtr = nullptr;
@@ -146,6 +216,33 @@ public:
     static void setCapacityHint(int _) {};
 };
 
+// CFT allocations are addressed by (endpointId, offset) rather than by pointer,
+// so a suballocation keeps its parent's endpoint plus a byte offset into it
+class MultinodeMemoryAllocationMulticastCFTRef : public MultinodeMemoryAllocationMulticastRef {
+    MemoryAllocationCFT *parent = nullptr;
+    size_t endpointOffset = 0;
+
+public:
+    MultinodeMemoryAllocationMulticastCFTRef(MemoryAllocationCFT *_parent, size_t _endpointOffset, void *_unicastMappingPtr, size_t _allocationSize, int _MPIrank)
+        : MultinodeMemoryAllocationMulticastRef(nullptr, _unicastMappingPtr, _allocationSize, _MPIrank) {
+        parent = _parent;
+        endpointOffset = _endpointOffset;
+    }
+    ~MultinodeMemoryAllocationMulticastCFTRef() {};
+
+    static bool filter();
+
+#if CUDA_VERSION >= 13030
+    CUlogicalEndpointId getEndpointId() override {
+        return parent->getEndpointId();
+    }
+
+    size_t getEndpointOffset() override {
+        return endpointOffset;
+    }
+#endif
+};
+
 class MultinodeMemoryAllocationMulticast : public MultinodeMemoryAllocationMulticastRef {
 private:
     CUmemGenericAllocationHandle handle = {};
@@ -166,6 +263,8 @@ private:
 public:
     MultinodeMemoryAllocationMulticast(size_t _allocationSize, int _MPIrank, bool useCudaPool = false);
     ~MultinodeMemoryAllocationMulticast();
+
+    std::unique_ptr<MultinodeMemoryAllocationMulticastRef> createRef(int chunkIndex, size_t chunkSize, int _MPIrank);
 };
 
 class MultinodeMemoryAllocationMulticastCudaPool : public MultinodeMemoryAllocationMulticast {
@@ -217,16 +316,21 @@ public:
 
     void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE) {current->memset(value, copyType, memoryPurpose);}
     unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0) {return current->check(value, copyType, iterations);}
+#if CUDA_VERSION >= 13030
+    CUlogicalEndpointId getEndpointId() override { return current->getEndpointId(); }
+    size_t getEndpointOffset() override { return current->getEndpointOffset(); }
+#endif
 };
 
+template<class T, class TRef>
 class MulticastPool : public MemoryAllocation {
 private:
     static inline std::multimap<size_t,
-        std::pair<std::shared_ptr<MultinodeMemoryAllocationMulticast>, int> > pool;
+        std::pair<std::shared_ptr<T>, int> > pool;
     static const int defaultInsertCount = 1;
     static inline int insertCount = defaultInsertCount;
-    std::unique_ptr<MultinodeMemoryAllocationMulticastRef> current;
-    std::shared_ptr<MultinodeMemoryAllocationMulticast> parent;
+    std::unique_ptr<TRef> current;
+    std::shared_ptr<T> parent;
     int offset;
 public:
     static void setCapacityHint(int _insertCount) {insertCount = _insertCount;}
@@ -240,11 +344,18 @@ public:
 
     void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE) {current->memset(value, copyType, memoryPurpose);}
     unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0) {return current->check(value, copyType, iterations);}
+#if CUDA_VERSION >= 13030
+    CUlogicalEndpointId getEndpointId() override { return current->getEndpointId(); }
+    size_t getEndpointOffset() override { return current->getEndpointOffset(); }
+#endif
 };
 
 template class AllocationPool<MultinodeMemoryAllocationUnicast>;
 template class AllocationPool<MultinodeMemoryAllocationEGM>;
 template class AllocationPool<HostMemoryAllocation>;
+template class AllocationPool<MultinodeMemoryAllocationUnicastCFT>;
+template class MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>;
+template class MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>;
 
 void clearAllocationPools();
 

@@ -19,6 +19,7 @@
 #define TESTCASES_H_
 #include <memory>
 #include <map>
+#include <random> 
 
 extern bool richOutput;
 extern int gpuToRackSamples;
@@ -26,6 +27,7 @@ extern std::string csvInputFile;
 extern std::string csvOutputFile;
 extern int iterations;
 extern int latencyIterations;
+extern std::mt19937 rng; 
 
 enum CopyCount {
     COPY_COUNT_UNIDIR = 0,

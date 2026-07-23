@@ -1,6 +1,21 @@
 # Changelog
 
-## [2.0.0] - 2026-03-TBD
+## [2.1.0] - 2026-07-23
+
+### Added
+- Added support for CUDA Compute Fabric Transport (CFT) programming model with a coverage of unicast and multicast testcases
+- Added fully random and random permutation (ring, bisect) fabric stress tests
+- Added TMA flavors of all-to-one/bisect/gpu-to-rack/rack-to-rack testcases
+- Added --blockCount argument to override block count of copy kernels
+- Added --tmaChunkSize argument to override TMA staging buffer size
+- Added --richOutput support to all-to-one, rack-aware-all-to-one and multicast_all_to_all testcases
+- Added support for CUDA MPS
+- Testcases now output median value alongside preexisting min/average/max/sum
+
+### Changed
+- Increased default TMA staging buffer size to 196 kB
+
+## [2.0.0] - 2026-04-01
 
 ### Added
 - Load sustainment algorithm was added to testcases that execute simultaneously multiple copies

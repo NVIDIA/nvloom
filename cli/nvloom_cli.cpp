@@ -18,13 +18,15 @@
 #include "nvloom.h"
 #include "util.h"
 #include "testcases.h"
+#include "kernels.cuh"
 
 #include <boost/program_options.hpp>
 #include <chrono>
 #include <iostream>
 #include <memory>
+#include <random>
 
-#define NVLOOM_VERSION "2.0.0"
+#define NVLOOM_VERSION "2.1.0"
 #ifndef GIT_COMMIT
 #define GIT_COMMIT "unknown"
 #endif
@@ -37,6 +39,7 @@ int iterations = NvLoom::getDefaultIterationCount();
 int latencyIterations = NvLoom::getDefaultLatencyIterationCount();
 bool enableProfiling = false;
 char bandwidthUnit = 'G';
+unsigned int seed = 0; // This value is always overwritten via randomness or CLI arg.
 
 bool shouldContinue(boost::program_options::variables_map &vm, int iteration, std::chrono::time_point<std::chrono::high_resolution_clock> startTime) {
     if (vm["repeat"].defaulted() && vm["duration"].defaulted()) {
@@ -84,13 +87,15 @@ int run_program(int argc, char **argv) {
     std::vector<std::string> suitesToRun;
     std::string allocatorStrategyString;
     std::string bufferSizeStr = std::to_string(NvLoom::getDefaultBufferSizeInMiB()) + "M";
+    std::string tmaChunkSizeStr = std::to_string(NvLoom::getDefaultTMAChunkSizeInKB()) + "K";
     size_t bufferSizeInBytes;
     bool listTestcases = false;
     int repeat = 1;
     int duration = -1;
+    int blockCount = 0;
     AllocatorStrategy allocatorStrategy;
 
-    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, rack-aware-all-to-one, egm, egm-gpu-to-rack, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency, pairwise-tma, multicast-tma");
+    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, rack-aware-all-to-one, egm, egm-gpu-to-rack, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency, csv, pairwise-tma, multicast-tma, pairwise-cft, multicast-cft");
     opts.add_options()
         ("help,h", "Produce help message")
         ("bufferSize,b", boost::program_options::value<std::string>(&bufferSizeStr)->default_value(bufferSizeStr), "Buffer size in bytes. Also accepts k, m, g, t suffixes for kibibytes, mebibytes, gibibytes and tebibytes respectively. Letter case is ignored. Byte count must be divisible by 128 bytes.")
@@ -98,7 +103,7 @@ int run_program(int argc, char **argv) {
         ("testcase,t", boost::program_options::value<std::vector<std::string>>(&testcasesToRun)->multitoken(), "Testcase(s) to run (by name)")
         ("suite,s", boost::program_options::value<std::vector<std::string>>(&suitesToRun)->multitoken(), suitesOptionDescription.c_str())
         ("listTestcases,l", boost::program_options::bool_switch(&listTestcases)->default_value(listTestcases), "List testcases")
-        ("richOutput,r", boost::program_options::bool_switch(&richOutput)->default_value(richOutput), "Rich output")
+        ("richOutput,r", boost::program_options::bool_switch(&richOutput)->default_value(richOutput), "Rich output. Supported for: all-to-one, rack-aware-all-to-one, gpu-to-rack, multicast-all-to-all")
         ("allocatorStrategy,a", boost::program_options::value<std::string>(&allocatorStrategyString)->default_value("reuse"), "Allocator strategy: choose between unique, reuse and cudapool")
         ("gpuToRackSamples", boost::program_options::value<int>(&gpuToRackSamples)->default_value(gpuToRackSamples), "Number of per-rack samples to use in gpu_to_rack testcases")
         ("csvInputFile", boost::program_options::value<std::string>(&csvInputFile)->default_value(csvInputFile), "CSV input file")
@@ -107,7 +112,10 @@ int run_program(int argc, char **argv) {
         ("repeat,c", boost::program_options::value<int>(&repeat)->default_value(repeat), "Number of times to repeat each testcase")
         ("duration,d", boost::program_options::value<int>(&duration)->default_value(duration), "Duration of each testcase in seconds")
         ("enableProfiling", boost::program_options::bool_switch(&enableProfiling)->default_value(enableProfiling), "Enable profiling by disabling spinkernels. This may reduce accuracy of performance results.")
+        ("blockCount", boost::program_options::value<int>(&blockCount)->default_value(blockCount), "Override the number of thread blocks launched by copy kernels. By default the kernels use min(SM count, 128). Must be a positive value.")
+        ("tmaChunkSize", boost::program_options::value<std::string>(&tmaChunkSizeStr)->default_value(tmaChunkSizeStr), (std::string("Override the chunk size for TMA copies (maximum ") + std::to_string(MAX_SMEM_CAPACITY_SIZE / 1024) + "KB). If the value is not a multiple of 16B, its closest multiple of 16B will be used. You may pass in a plain integer (bytes), or append b/B for bytes and k/K for kibibytes.").c_str())
         ("bandwidthUnit", boost::program_options::value<char>(&bandwidthUnit)->default_value(bandwidthUnit), "Unit of reported bandwidths. Acceptable values are K, M, G, T for KB/s, MB/s, GB/s and TB/s respectively. Letter case is ignored.")
+        ("seed", boost::program_options::value<unsigned int>(&seed)->default_value(seed), "Seed for random number generator. The value must be unsigned. If not specified, the default value is randomly decided.")
         ;
 
     boost::program_options::variables_map vm;
@@ -116,8 +124,8 @@ int run_program(int argc, char **argv) {
         boost::program_options::notify(vm);
 
         bufferSizeInBytes = getBufferSizeInBytes(bufferSizeStr);
-        if (bufferSizeInBytes % 128 != 0) {
-            throw std::runtime_error("Buffer size must be divisible by 128 bytes");
+        if (bufferSizeInBytes < 1 || bufferSizeInBytes % 128 != 0) {
+            throw std::runtime_error("Buffer size must be a positive integer and divisible by 128 bytes");
         }
         allocatorStrategy = getAllocatorStrategy(allocatorStrategyString);
 
@@ -125,9 +133,51 @@ int run_program(int argc, char **argv) {
             throw std::runtime_error("Latency iterations must be at least 1024");
         }
 
+        if (gpuToRackSamples < 1) {
+            throw std::runtime_error("Number of per-rack samples must be at least 1");
+        }
+
+        if (iterations < 1) {
+            throw std::runtime_error("Number of copy iterations must be at least 1");
+        }
+
         if (!vm["repeat"].defaulted() && !vm["duration"].defaulted()) {
             throw std::runtime_error("Cannot specify both repeat and duration");
         }
+
+        if (repeat < 1) {
+            throw std::runtime_error("Number of times to repeat each testcase must be at least 1");
+        }
+
+        if (!vm["duration"].defaulted() && duration < 1) {
+            throw std::runtime_error("The duration of each testcase must be at least 1 second");
+        }
+
+        if (!vm["blockCount"].defaulted() && blockCount <= 0) {
+            throw std::runtime_error("Block count must be a positive value");
+        }
+
+        if (!vm["tmaChunkSize"].defaulted()) {
+            size_t requestedTmaChunkSize = getBufferSizeInBytes(tmaChunkSizeStr);
+            if (requestedTmaChunkSize < 16) {
+                throw std::runtime_error("TMA chunk size must be at least 16B.");
+            }
+            if (requestedTmaChunkSize > MAX_SMEM_CAPACITY_SIZE) {
+                throw std::runtime_error("TMA chunk size must be at most " + std::to_string(MAX_SMEM_CAPACITY_SIZE / 1024) + "KB.");
+            }
+            int tmaChunkSize = static_cast<int>(requestedTmaChunkSize);
+            tmaChunkSize = (tmaChunkSize / 16) * 16;
+            tmaChunkSize = std::min(tmaChunkSize, (int)(MAX_SMEM_CAPACITY_SIZE - 16));
+            NvLoom::setTmaChunkSize(tmaChunkSize);
+        }
+
+        if (vm["seed"].defaulted()) {
+            std::random_device random_dev;
+            seed = random_dev();
+        }
+        MPIWrapper::instance(); // Required before MPI broadcasting
+        MPI_Bcast(&seed, 1, MPI_UNSIGNED, 0, MPI_COMM_WORLD);
+        rng.seed(seed);
 
         bandwidthUnit = getBandwidthUnit(bandwidthUnit);
     } catch (const std::exception& e) {
@@ -150,6 +200,8 @@ int run_program(int argc, char **argv) {
     OUTPUT << "Allocation strategy: " << allocatorStrategyString << std::endl;
     OUTPUT << "Buffer size: " << bufferSizeInBytes << " bytes" << std::endl;
     OUTPUT << "Iteration count: " << iterations << std::endl;
+    OUTPUT << "Seed: " << seed << std::endl;
+    OUTPUT << "TMA chunk size: " << NvLoom::getTmaChunkSize() << std::endl;
 
     auto [testcases, suites] = buildTestcases(allocatorStrategy);
 
@@ -166,6 +218,10 @@ int run_program(int argc, char **argv) {
     NvLoom::initialize(localDevice, rackToProcessMap);
     if (enableProfiling) {
         NvLoom::disableSpinKernels();
+    }
+    if (!vm["blockCount"].defaulted()) {
+        NvLoom::setCopyKernelBlockCountOverride(blockCount);
+        OUTPUT << "Copy kernel block count override: " << blockCount << std::endl;
     }
 
     std::set<std::string> testcasesToRunSet;

@@ -34,6 +34,20 @@ void MemoryAllocation::memset(int value, CopyType copyType, MemoryPurpose memory
     }
 }
 
+#if CUDA_VERSION >= 13030
+CUlogicalEndpointId MemoryAllocation::getEndpointId() {
+    // This should never be called
+    ASSERT(0);
+    return {};
+}
+
+size_t MemoryAllocation::getEndpointOffset() {
+    // This should never be called
+    ASSERT(0);
+    return 0;
+}
+#endif
+
 DeviceMemoryAllocation::DeviceMemoryAllocation(size_t _allocationSize, int _MPIrank) {
     MPIrank = _MPIrank;
     if (MPIrank == MPIWrapper::getWorldRank()) {
@@ -145,6 +159,234 @@ bool MultinodeMemoryAllocationEGM::filter() {
     return pi != 0;
 };
 
+size_t MemoryAllocationCFT::getRoundedAllocationSize(size_t _allocationSize) {
+    memProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    memProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    memProp.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    memProp.location.id = NvLoom::getLocalDevice();
+
+    size_t granularity = 0;
+    CU_ASSERT(cuMemGetAllocationGranularity(&granularity, &memProp, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+    return roundUp(_allocationSize, granularity);
+}
+
+void *MemoryAllocationCFT::allocateMemory(size_t _allocationSize) {
+    void *ptr;
+    roundedUpAllocationSize = getRoundedAllocationSize(_allocationSize);
+    // Allocate the memory
+    CU_ASSERT(cuMemCreate(&handle, roundedUpAllocationSize, &memProp, 0 /*flags*/));
+
+    // Map the memory
+    CU_ASSERT(cuMemAddressReserve((CUdeviceptr *) &ptr, roundedUpAllocationSize, 0, 0 /*baseVA*/, 0 /*flags*/));
+
+    CU_ASSERT(cuMemMap((CUdeviceptr) ptr, roundedUpAllocationSize, 0 /*offset*/, handle, 0 /*flags*/));
+
+    CUmemAccessDesc desc = {};
+    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = NvLoom::getLocalDevice();
+    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CU_ASSERT(cuMemSetAccess((CUdeviceptr) ptr, roundedUpAllocationSize, &desc, 1 /*count*/));
+
+    return ptr;
+}
+
+void MemoryAllocationCFT::freeMemory(void *ptr) {
+    CU_ASSERT(cuMemUnmap((CUdeviceptr) ptr, roundedUpAllocationSize));
+    CU_ASSERT(cuMemRelease(handle));
+    CU_ASSERT(cuMemAddressFree((CUdeviceptr) ptr, roundedUpAllocationSize));
+}
+
+MultinodeMemoryAllocationUnicastCFT::MultinodeMemoryAllocationUnicastCFT(size_t _allocationSize, int _MPIrank) {
+#if CUDA_VERSION >= 13030
+    CU_ASSERT(cuLogicalEndpointIdReserve(&endpointId, 1 /*count*/));
+    CUlogicalEndpointProp endpointProp = {};
+    endpointProp.unicast.device = NvLoom::getLocalDevice();
+    endpointProp.flags = 0;
+    endpointProp.ipcHandleTypes = CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC;
+    endpointProp.type = CU_LOGICAL_ENDPOINT_TYPE_UNICAST;
+    // cuLogicalEndpointBindMem binds the granularity-rounded size, which must fit within the endpoint
+    endpointProp.size = getRoundedAllocationSize(_allocationSize);
+
+    CUlogicalEndpointFabricHandle fh = {};
+
+    if (_MPIrank == MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuLogicalEndpointCreate(endpointId, &endpointProp));
+
+        int queryStatus = 0;
+        while (queryStatus == 0) {
+            CU_ASSERT(cuLogicalEndpointQuery(endpointId, 1, &queryStatus));
+        }
+
+        ptr = allocateMemory(_allocationSize);
+
+        // Bind memory
+        CU_ASSERT(cuLogicalEndpointBindMem(endpointId, NvLoom::getLocalDevice(), 0, handle, 0, roundedUpAllocationSize, 0 /*flags*/));
+
+        CU_ASSERT(cuLogicalEndpointExport(&fh, endpointId, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
+    }
+
+    MPI_Bcast(&fh, sizeof(fh), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
+
+    if (_MPIrank != MPIWrapper::getWorldRank()) {
+        // Only local process can access the memory through pointers
+        ptr = nullptr;
+
+        CU_ASSERT(cuLogicalEndpointImport(endpointId, (void *)&fh, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
+
+        int queryStatus = 0;
+        while (queryStatus == 0) {
+            CU_ASSERT(cuLogicalEndpointQuery(endpointId, 1, &queryStatus));
+        }
+    }
+
+    MPIrank = _MPIrank;
+    allocationSize = _allocationSize;
+
+    // Make sure that everyone is done with mapping the fabric allocation
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+MultinodeMemoryAllocationUnicastCFT::~MultinodeMemoryAllocationUnicastCFT() {
+#if CUDA_VERSION >= 13030
+    // Make sure that everyone is done using the memory
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (MPIrank == MPIWrapper::getWorldRank()) {
+        freeMemory(ptr);
+    }
+
+    CU_ASSERT(cuLogicalEndpointDestroy(endpointId));
+    CU_ASSERT(cuLogicalEndpointIdRelease(endpointId, 1 /*count*/));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+bool MultinodeMemoryAllocationUnicastCFT::filter() {
+#if CUDA_VERSION >= 13030
+    // Drivers older than 13.3 reject the attribute query below with CUDA_ERROR_INVALID_VALUE
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    if (driverVersion < 13030) {
+        return false;
+    }
+
+    int unicastSupported;
+    CU_ASSERT(cuDeviceGetAttribute(&unicastSupported, CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
+    return unicastSupported != 0;
+#else
+    return false;
+#endif
+};
+
+MultinodeMemoryAllocationMulticastCFT::MultinodeMemoryAllocationMulticastCFT(size_t _allocationSize, int _MPIrank) {
+#if CUDA_VERSION >= 13030
+    CU_ASSERT(cuLogicalEndpointIdReserve(&endpointId, 1 /*count*/));
+    CUlogicalEndpointProp endpointProp = {};
+    endpointProp.multicast.numDevices = MPIWrapper::getWorldSize();
+    endpointProp.flags = 0;
+    endpointProp.ipcHandleTypes = CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC;
+    endpointProp.type = CU_LOGICAL_ENDPOINT_TYPE_MULTICAST;
+    // cuLogicalEndpointBindMem binds the granularity-rounded size, which must fit within the endpoint
+    endpointProp.size = getRoundedAllocationSize(_allocationSize);
+
+    CUlogicalEndpointFabricHandle fh = {};
+
+    if (_MPIrank == MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuLogicalEndpointCreate(endpointId, &endpointProp));
+        CU_ASSERT(cuLogicalEndpointExport(&fh, endpointId, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
+    }
+
+    MPI_Bcast(&fh, sizeof(fh), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
+
+    if (_MPIrank != MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuLogicalEndpointImport(endpointId, (void *)&fh, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
+    }
+
+    CU_ASSERT(cuLogicalEndpointAddDevice(endpointId, NvLoom::getLocalCuDevice()));
+
+    int queryStatus = 0;
+    while (queryStatus == 0) {
+        CU_ASSERT(cuLogicalEndpointQuery(endpointId, 1, &queryStatus));
+    }
+
+    unicastMappingPtr = allocateMemory(_allocationSize);
+
+    CU_ASSERT(cuLogicalEndpointBindMem(endpointId, NvLoom::getLocalDevice(), 0, handle, 0, roundedUpAllocationSize, 0 /*flags*/));
+
+    MPIrank = _MPIrank;
+    allocationSize = _allocationSize;
+
+    // Make sure that everyone is done with mapping the fabric allocation
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+MultinodeMemoryAllocationMulticastCFT::~MultinodeMemoryAllocationMulticastCFT() {
+#if CUDA_VERSION >= 13030
+    // Make sure that everyone is done using the memory
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    freeMemory(unicastMappingPtr);
+
+    CU_ASSERT(cuLogicalEndpointDestroy(endpointId));
+    CU_ASSERT(cuLogicalEndpointIdRelease(endpointId, 1 /*count*/));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+bool MultinodeMemoryAllocationMulticastCFT::filter() {
+#if CUDA_VERSION >= 13030
+    // Drivers older than 13.3 reject the attribute query below with CUDA_ERROR_INVALID_VALUE
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    if (driverVersion < 13030) {
+        return false;
+    }
+
+    if (getMajorDriverVersion() < 610) {
+        return false;
+    }
+
+    int multicastSupported;
+    CU_ASSERT(cuDeviceGetAttribute(&multicastSupported, CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
+    return multicastSupported != 0;
+#else
+    return false;
+#endif
+};
+
+void MultinodeMemoryAllocationMulticastCFT::memset(int value, CopyType copyType, MemoryPurpose memoryPurpose) {
+    memsetBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, memoryPurpose);
+}
+
+unsigned long long MultinodeMemoryAllocationMulticastCFT::check(int value, CopyType copyType, int iterations) {
+    return checkBuffer(unicastMappingPtr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, iterations);
+}
+
+std::unique_ptr<MultinodeMemoryAllocationMulticastCFTRef> MultinodeMemoryAllocationMulticastCFT::createRef(int chunkIndex, size_t chunkSize, int _MPIrank) {
+    return std::make_unique<MultinodeMemoryAllocationMulticastCFTRef>(this,
+        (size_t) chunkIndex * chunkSize,
+        (char *) unicastMappingPtr + (size_t) chunkIndex * chunkSize,
+        chunkSize, _MPIrank);
+}
+
+bool MultinodeMemoryAllocationMulticastCFTRef::filter() {
+    return MultinodeMemoryAllocationMulticastCFT::filter();
+}
+
+
 void MultinodeMemoryAllocationMulticast::createMulticastGroup() {
     handleType = CU_MEM_HANDLE_TYPE_FABRIC;
     multicastProp.numDevices = MPIWrapper::getWorldSize();
@@ -230,6 +472,8 @@ MultinodeMemoryAllocationMulticast::MultinodeMemoryAllocationMulticast(size_t _a
 }
 
 void MultinodeMemoryAllocationMulticast::releaseMemory() {
+    CU_ASSERT(cuMemUnmap((CUdeviceptr) unicastMappingPtr, roundedUpAllocationSize));
+    CU_ASSERT(cuMemAddressFree((CUdeviceptr) unicastMappingPtr, roundedUpAllocationSize));
     CU_ASSERT(cuMemRelease(handle));
 }
 
@@ -270,6 +514,13 @@ bool MultinodeMemoryAllocationMulticastRef::filter() {
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
     return pi != 0;
 };
+
+std::unique_ptr<MultinodeMemoryAllocationMulticastRef> MultinodeMemoryAllocationMulticast::createRef(int chunkIndex, size_t chunkSize, int _MPIrank) {
+    return std::make_unique<MultinodeMemoryAllocationMulticastRef>(
+        (char *) ptr + (size_t) chunkIndex * chunkSize,
+        (char *) unicastMappingPtr + (size_t) chunkIndex * chunkSize,
+        chunkSize, _MPIrank);
+}
 
 void Pools::initPools(CUmemLocationType location) {
     if (!pools[location].empty()) {
@@ -410,7 +661,8 @@ std::string AllocationPool<T>::getName() {
     return T::getName();
 }
 
-MulticastPool::MulticastPool(size_t _allocationSize, int _MPIrank) {
+template<class T, class TRef>
+MulticastPool<T, TRef>::MulticastPool(size_t _allocationSize, int _MPIrank) {
     allocationSize = _allocationSize;
     MPIrank = _MPIrank;
 
@@ -418,7 +670,7 @@ MulticastPool::MulticastPool(size_t _allocationSize, int _MPIrank) {
 
     if (it == pool.end()) {
         // Create one large allocation and suballocate it into smaller chunks
-        auto largeAllocation = std::make_shared<MultinodeMemoryAllocationMulticast>(insertCount * allocationSize, 0);
+        auto largeAllocation = std::make_shared<T>(insertCount * allocationSize, 0);
         for (int i = 0; i < insertCount; i++) {
             pool.insert({allocationSize, {largeAllocation, i}});
         }
@@ -432,32 +684,38 @@ MulticastPool::MulticastPool(size_t _allocationSize, int _MPIrank) {
     offset = it->second.second;
     pool.erase(it);
 
-    ptr = (char *) parent->ptr + offset * allocationSize;
-    void *unicastMappingPtr = (char *) parent->unicastMappingPtr + (size_t) offset * allocationSize;
-
-    current = std::make_unique<MultinodeMemoryAllocationMulticastRef>(ptr, unicastMappingPtr, allocationSize, MPIrank);
+    // The parent knows how to address its suballocations
+    // (pointer arithmetic for regular multicast, endpointId + offset for CFT)
+    current = parent->createRef(offset, allocationSize, MPIrank);
+    ptr = current->ptr;
 }
 
-MulticastPool::~MulticastPool() {
+template<class T, class TRef>
+MulticastPool<T, TRef>::~MulticastPool() {
     pool.insert({allocationSize, {parent, offset}});
 }
 
-void MulticastPool::clear() {
+template<class T, class TRef>
+void MulticastPool<T, TRef>::clear() {
     setCapacityHint(defaultInsertCount);
     pool.clear();
 }
 
-bool MulticastPool::filter() {
-    return MultinodeMemoryAllocationMulticast::filter();
+template<class T, class TRef>
+bool MulticastPool<T, TRef>::filter() {
+    return T::filter();
 }
 
-std::string MulticastPool::getName() {
-    return MultinodeMemoryAllocationMulticast::getName();
+template<class T, class TRef>
+std::string MulticastPool<T, TRef>::getName() {
+    return T::getName();
 }
 
 void clearAllocationPools() {
     AllocationPool<MultinodeMemoryAllocationUnicast>::clear();
     AllocationPool<MultinodeMemoryAllocationEGM>::clear();
     AllocationPool<HostMemoryAllocation>::clear();
-    MulticastPool::clear();
+    AllocationPool<MultinodeMemoryAllocationUnicastCFT>::clear();
+    MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>::clear();
+    MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>::clear();
 }

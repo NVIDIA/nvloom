@@ -31,6 +31,7 @@ import numpy as np
 import os
 import pathlib
 import sys
+import warnings
 from collections.abc import Iterator
 from ClusterShell.NodeSet import NodeSet
 
@@ -82,8 +83,8 @@ def generate_stats_plot(args: argparse.Namespace,
                    va="center",
                    color=TEXTCOLORS[int(additional_values[i]) > color_threshold],
                    fontsize=fontsize)
-    stats.set_xticks(np.arange(3), labels=["min", "avg", "max"], fontsize=args.legend_fontsize)
-    stats.set_xticks(np.arange(2)+.5, minor=True)
+    stats.set_xticks(np.arange(4), labels=["min", "avg", "med", "max"], fontsize=args.legend_fontsize)
+    stats.set_xticks(np.arange(3)+.5, minor=True)
     stats.set_yticks([])
     stats.spines[:].set_visible(False)
     stats.set_title("summary", fontsize=args.title_fontsize)
@@ -153,9 +154,11 @@ def apply_heatmap_data_labels(heatmap: plt.Axes, results: list[list[float]], thr
                              fontsize=fontsize)
 
 
-def get_stats_values(results: list[list[float]]) -> tuple[float, float, float]:
-    results_flattened = list(flatten_results(results))
-    return min(results_flattened), sum(results_flattened)/len(results_flattened), max(results_flattened)
+def get_stats_values(results: list[list[float]]) -> tuple[float, float, float, float]:
+    results_flattened = sorted(list(flatten_results(results)))
+    n = len(results_flattened)
+    median = (results_flattened[(n - 1) // 2] + results_flattened[n // 2]) / 2
+    return min(results_flattened), sum(results_flattened) / n, median, max(results_flattened)
 
 
 def validate_limits(args: argparse.Namespace, min_value: float, max_value: float) -> None:
@@ -172,7 +175,8 @@ def validate_limits(args: argparse.Namespace, min_value: float, max_value: float
 
 def get_data_fontsize(args: argparse.Namespace, results: list[list[float]]) -> float:
     results_flattened = list(flatten_results(results))
-    max_value_len = math.ceil(math.log10(max(results_flattened)))
+    max_value = max(results_flattened) if results_flattened else 1.0
+    max_value_len = math.ceil(math.log10(max(max_value, 1.0)))
     max_value_scaling_factor = math.pow((4. / max(max_value_len, 4)), 2.5)
     max_dim = max(len(results), len(results[0]))
     return args.data_fontsize_scaling_factor * 60. * max_value_scaling_factor * (6. / max_dim)
@@ -236,7 +240,7 @@ def plot_heatmap(args: argparse.Namespace,
     if all(all(math.isnan(elem) for elem in sublist) for sublist in results):
         return
 
-    min_value, avg_value, max_value = get_stats_values(results)
+    min_value, avg_value, med_value, max_value = get_stats_values(results)
     validate_limits(args, min_value, max_value)
 
     fig, (heatmap, stats) = plt.subplots(2, 1, gridspec_kw={"height_ratios": [math.sqrt(len(labels_y)), 1]})
@@ -247,9 +251,9 @@ def plot_heatmap(args: argparse.Namespace,
     # depending on the field value, we will be adjusting text color to make it visible
     threshold = max_value/2.
 
-    # generate the "stats" plot, with min/avg/max
+    # generate the "stats" plot, with min/avg/med/max
     stats_fontsize = math.floor(math.sqrt(len(labels_y))) * fontsize
-    generate_stats_plot(args, stats, [min_value, avg_value, max_value], threshold, stats_fontsize)
+    generate_stats_plot(args, stats, [min_value, avg_value, med_value, max_value], threshold, stats_fontsize)
 
     # create numerical labels for each heatmap field
     if not args.no_heatmap_data_labels:
@@ -260,7 +264,7 @@ def plot_heatmap(args: argparse.Namespace,
 
 
 def get_unique_nodes_from_labels(nodes: list[str]) -> list[str]:
-    nodes = [node.split("/")[0] for node in nodes]
+    nodes = [node.split("/")[0].split("->")[0] for node in nodes]
     return list(set(nodes))
 
 
@@ -324,9 +328,13 @@ def plot_result(args: argparse.Namespace,
     # fig.tight_layout()
     fig.set_size_inches(args.plot_size, args.plot_size)
     try:
-        plt.savefig(str(path / f"{args.filename_prefix}{name}.{args.file_format}"))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error")
+            plt.savefig(str(path / f"{args.filename_prefix}{name}.{args.file_format}"))
     except Exception as e:
         print(f"Error saving plot to file: {e}")
+        plt.close(fig)
+        raise
     plt.close(fig)
 
 
@@ -415,6 +423,8 @@ def main() -> None:
     lines = sys.stdin.read().split("\n")
     lines = [x for x in lines if x != "" and not x.startswith("sleeping for")]
 
+    failed = False
+
     current_line = 0
     while current_line < len(lines):
         # get information about processes
@@ -466,8 +476,12 @@ def main() -> None:
                             unit)
             except Exception as e:
                 print(f"Error plotting {name} heatmap: {e}")
+                failed = True
 
         current_line += 1
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@
 #include <vector>
 #include "enums.h"
 
+inline constexpr size_t MAX_SMEM_CAPACITY_SIZE = 227ULL * 1024ULL;
+
 const unsigned long long DEFAULT_SPIN_KERNEL_TIMEOUT_MS = 10000ULL;   // 10 seconds
 
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
@@ -34,8 +36,17 @@ void pointerChase(CUdeviceptr ptr, size_t size, unsigned long long iterations, s
 void copyKernelMulticastLdReduce(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
 void copyKernelMulticastRed(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
 void copyKernelMulticastRedTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
+#if CUDA_VERSION >= 13030
+void copyKernelCFTRead(CUdeviceptr dstBuffer, CUlogicalEndpointId srcEndpointId, size_t srcEndpointOffset, size_t size, CUstream stream, unsigned long long loopCount);
+void copyKernelCFTWrite(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
+void copyKernelCFTWriteMulticast(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
+void copyKernelCFTReduceMulticast(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount);
+void copyKernelCFTPullredMulticast(CUdeviceptr dstBuffer, CUlogicalEndpointId srcEndpointId, size_t srcEndpointOffset, size_t size, CUstream stream, unsigned long long loopCount);
+
+#endif
 
 bool tmaMulticastSupported();
+bool cftSupported();
 
 CUresult spinKernelMultistage(volatile int *latch1, volatile int *latch2, CUstream stream, unsigned long long timeoutMs = DEFAULT_SPIN_KERNEL_TIMEOUT_MS);
 

@@ -26,6 +26,7 @@
 
 constexpr unsigned int defaultNumThreadPerBlock = 512;
 constexpr unsigned int multicastNumThreadPerBlock = 1024;
+constexpr unsigned int fillCheckNumBlocks = 256;
 
 template<typename T>
 using write_to_memory = void (*)(T*, T);
@@ -72,7 +73,7 @@ __global__ void stridingMemcpyKernel(unsigned int totalThreadCount, unsigned lon
     size_t bigChunkSizeInElement = chunkSizeInElement / 12;
     T *dstBigEnd = dst + (bigChunkSizeInElement * 12) * totalThreadCount;
 
-    for (unsigned int i = 0; i < loopCount; i++) {
+    for (unsigned long long i = 0; i < loopCount; i++) {
         T* cdst = dst;
         T* csrc = src;
 
@@ -119,7 +120,7 @@ __global__ void simpleMemcpyKernel(unsigned int totalThreadCount, unsigned long 
     dst += globalThreadId;
     src += globalThreadId;
 
-    for (unsigned int i = 0; i < loopCount; i++) {
+    for (unsigned long long i = 0; i < loopCount; i++) {
         T* cdst = dst;
         T* csrc = src;
 
@@ -131,7 +132,7 @@ __global__ void simpleMemcpyKernel(unsigned int totalThreadCount, unsigned long 
 
 template<typename T, auto kernel>
 void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount, unsigned int numThreadPerBlock) {
-    int numBlocks = std::min(NvLoom::getLocalMultiprocessorCount(), 128);
+    int numBlocks = NvLoom::getCopyKernelBlockCount();
 
     unsigned int totalThreadCount = numBlocks * numThreadPerBlock;
 
@@ -152,15 +153,20 @@ void launchCopyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size,
     CUDA_ASSERT(cudaLaunchKernelEx(&config, kernel, totalThreadCount, loopCount, (T *) dstBuffer, (T *) srcBuffer, sizeInElement));
 }
 
-// TMA kernels
-#define TMA_CHUNK_SIZE_BYTES 32768
-
 #if __CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 1
 #define TMA_MULTICAST_SUPPORTED 1
 #elif __CUDACC_VER_MAJOR__ > 13
 #define TMA_MULTICAST_SUPPORTED 1
 #else
 #define TMA_MULTICAST_SUPPORTED 0
+#endif
+
+#if __CUDACC_VER_MAJOR__ >= 13 && __CUDACC_VER_MINOR__ >= 3
+#define CFT_SUPPORTED 1
+#elif __CUDACC_VER_MAJOR__ > 13
+#define CFT_SUPPORTED 1
+#else
+#define CFT_SUPPORTED 0
 #endif
 
 template <int chunk_size_bytes>
@@ -290,35 +296,35 @@ inline __device__ void cp_async_bulk_shared_to_global_multicast_red(void *dest, 
 #endif
 }
 
-template<size_t bytesChunk, cp_async_bulk_shared_to_global_func write>
-__global__ void memcpyKernelTma(unsigned long long loopCount, char* dst, char* src, size_t size) {
+template<cp_async_bulk_shared_to_global_func write>
+__global__ void memcpyKernelTma(unsigned long long loopCount, char* dst, char* src, size_t size, int tmaChunkSize) {
 #if __CUDA_ARCH__ >= 900
-    assert(size % TMA_CHUNK_SIZE_BYTES == 0 && "TMA memcpy kernels require copy size to be a multiple of TMA_CHUNK_SIZE_BYTES");
+    assert(tmaChunkSize > 0 && tmaChunkSize % 16 == 0 && "TMA chunk size must be a positive multiple of 16B");
+    assert(size % 16 == 0 && "TMA memcpy kernels require copy size to be a multiple of 16B");
     extern __shared__ char smem_bytes[];
-    using SMEM_T = SMEM<bytesChunk>;
-    SMEM_T &smem = reinterpret_cast<SMEM_T&>(smem_bytes);
-    __mbarrier_init(&smem.bar, 1);
+    __mbarrier_t *bar = reinterpret_cast<__mbarrier_t*>(smem_bytes + tmaChunkSize);
+    __mbarrier_init(bar, 1);
 
     assert(blockDim.x == 1 && "There is zero reason to run this kernel with more than 1 thread / block.");
 
-    size_t block_stride = size_t(bytesChunk) * size_t(blockIdx.x);
-    size_t grid_stride = size_t(gridDim.x) * size_t(bytesChunk);
+    size_t block_stride = size_t(tmaChunkSize) * size_t(blockIdx.x);
+    size_t grid_stride = size_t(gridDim.x) * size_t(tmaChunkSize);
     for (unsigned long long loop = 0; loop < loopCount; loop++) {
         for (size_t i = block_stride; i < size; i += grid_stride) {
-            size_t bytesToCopy = bytesChunk;
+            size_t bytesToCopy = tmaChunkSize;
             if (i + bytesToCopy > size) {
                 bytesToCopy = size - i;
             }
 
-            cp_async_bulk_global_to_shared(&smem.buf[0], src + i, &smem.bar, bytesToCopy);
-            __mbarrier_token_t token = barrier_arrive1_tx(&smem.bar, bytesToCopy);
+            cp_async_bulk_global_to_shared(&smem_bytes[0], src + i, bar, bytesToCopy);
+            __mbarrier_token_t token = barrier_arrive1_tx(bar, bytesToCopy);
 
             // Wait for previous transfer. Retry in case of false. (waiting can fail)
-            while (!barrier_try_wait_token(&smem.bar, token)) {}
+            while (!barrier_try_wait_token(bar, token)) {}
             // Data in smem_buf is ready.
 
             // Write it out to peer global memory
-            write(dst + i, &smem.buf[0], bytesToCopy);
+            write(dst + i, &smem_bytes[0], bytesToCopy);
 
             // Commits previously issued TMA instruction from POV of this thread. Read to SMEM have not yet completed.
             cp_async_bulk_commit_group();
@@ -334,12 +340,19 @@ __global__ void memcpyKernelTma(unsigned long long loopCount, char* dst, char* s
 
 template<cp_async_bulk_shared_to_global_func write>
 void launchCopyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
-    int numBlocks = std::min(NvLoom::getLocalMultiprocessorCount(), 128);
+    int numBlocks = NvLoom::getCopyKernelBlockCount();
+    int tmaChunkSize = NvLoom::getTmaChunkSize();
+
+    // barrier is 8B
+    int smemBytes = tmaChunkSize + static_cast<int>(sizeof(__mbarrier_t));
+    ASSERT(tmaChunkSize > 0 && tmaChunkSize % 16 == 0);
+    ASSERT(smemBytes <= (int)MAX_SMEM_CAPACITY_SIZE);
+    CUDA_ASSERT(cudaFuncSetAttribute((void*)memcpyKernelTma<write>, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
 
     cudaLaunchConfig_t config = {0};
     config.gridDim = dim3(numBlocks, 1, 1);
     config.blockDim = dim3(1, 1, 1);
-    config.dynamicSmemBytes = sizeof(SMEM<TMA_CHUNK_SIZE_BYTES>);
+    config.dynamicSmemBytes = static_cast<unsigned int>(smemBytes);
     config.stream = stream;
     cudaLaunchAttribute cudaAttr;
     cudaAttr.id = cudaLaunchAttributeNvlinkUtilCentricScheduling;
@@ -347,7 +360,7 @@ void launchCopyKernelTma(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t si
     config.attrs = &cudaAttr;
     config.numAttrs = 1;
 
-    CUDA_ASSERT(cudaLaunchKernelEx(&config, memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, write>, loopCount, (char *) dstBuffer, (char *) srcBuffer, size));
+    CUDA_ASSERT(cudaLaunchKernelEx(&config, memcpyKernelTma<write>, loopCount, (char *) dstBuffer, (char *) srcBuffer, size, tmaChunkSize));
 }
 
 void copyKernel(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
@@ -377,6 +390,318 @@ void copyKernelMulticastLdReduce(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, s
 void copyKernelMulticastRed(CUdeviceptr dstBuffer, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
     launchCopyKernel<uint, simpleMemcpyKernel<uint, reduce_from_multicast_red<uint> > >(dstBuffer, srcBuffer, size, stream, loopCount, multicastNumThreadPerBlock);
 }
+
+#if CUDA_VERSION >= 13030
+#define CFT_TMA_BAR_OFFSET(tmaChunkSize)    ((tmaChunkSize))
+#define CFT_FABRIC_BAR_OFFSET(tmaChunkSize) ((tmaChunkSize) + 16)
+#define CFT_SMEM_BYTES(tmaChunkSize)        ((tmaChunkSize) + 2 * 16)
+
+inline __device__ void fabric_try_put(unsigned int dstLeId, unsigned long long dstDataOff,
+                                      void *src, unsigned int size, __mbarrier_t *barrier) {
+#if __CUDA_ARCH__ >= 1000
+    uint32_t src_smem = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "fabric.try_put.async.shared::cta.mbarrier::complete_tx::16B.mbarrier::report::fabric.relaxed.sys.b128 "
+        "[%0, %1], [%2], %3, [%4];\n"
+        :
+        : "r"(dstLeId), "l"(dstDataOff), "r"(src_smem), "r"(size), "r"(bar_smem)
+        : "memory");
+#endif
+}
+
+inline __device__ void fabric_try_put_multicast(unsigned int dstLeId, unsigned long long dstDataOff,
+    void *src, unsigned int size, __mbarrier_t *barrier) {
+#if __CUDA_ARCH__ >= 1000
+    uint32_t src_smem = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "fabric.try_put.async.multimem.shared::cta.mbarrier::complete_tx::16B.mbarrier::report::fabric.relaxed.sys.b128 "
+        "[%0, %1], [%2], %3, [%4];\n"
+        :
+        : "r"(dstLeId), "l"(dstDataOff), "r"(src_smem), "r"(size), "r"(bar_smem)
+        : "memory");
+#endif
+}
+
+
+inline __device__ void fabric_try_red_multicast(unsigned int dstLeId, unsigned long long dstDataOff,
+    void *src, unsigned int size, __mbarrier_t *barrier) {
+#if __CUDA_ARCH__ >= 1000
+    uint32_t src_smem = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "fabric.try_red.async.multimem.shared::cta.mbarrier::complete_tx::16B.mbarrier::report::fabric.relaxed.sys.add.u32 "
+        "[%0, %1], [%2], %3, [%4];\n"
+        :
+        : "r"(dstLeId), "l"(dstDataOff), "r"(src_smem), "r"(size), "r"(bar_smem)
+        : "memory");
+#endif
+}
+
+inline __device__ void fabric_try_get(void *dst, unsigned int srcLeId, unsigned long long srcDataOff,
+    unsigned int size, __mbarrier_t *barrier) {
+#if __CUDA_ARCH__ >= 1000
+    uint32_t dst_smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "fabric.try_get.async.shared::cta.mbarrier::complete_tx::bytes.mbarrier::report::fabric.relaxed.sys.b128 "
+        "[%0], [%1, %2], %3, [%4];\n"
+        :
+        : "r"(dst_smem), "r"(srcLeId), "l"(srcDataOff), "r"(size), "r"(bar_smem)
+        : "memory");
+#endif
+}
+
+inline __device__ void fabric_try_pullred_multicast(void *dst, unsigned int srcLeId, unsigned long long srcDataOff,
+unsigned int size, __mbarrier_t *barrier) {
+#if __CUDA_ARCH__ >= 1000
+    uint32_t dst_smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    uint32_t bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile(
+        "fabric.try_pullred.async.multimem.shared::cta.mbarrier::complete_tx::bytes.mbarrier::report::fabric.add.u32.sync.relaxed.sys "
+        "[%0], [%1, %2], %3, [%4], 0xFFFFFFFF;\n"
+        :
+        : "r"(dst_smem), "r"(srcLeId), "l"(srcDataOff), "r"(size), "r"(bar_smem)
+        : "memory");
+#endif
+}
+
+#if __CUDA_ARCH__ >= 1000
+inline __device__ void mbarrier_init_v1(__mbarrier_t *barrier, uint32_t expected_count) {
+    uint32_t bar = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.init.layout::v1.shared::cta.b64 [%0], %1;\n"
+                 :
+                 : "r"(bar), "r"(expected_count)
+                 : "memory");
+}
+
+inline __device__ void fabric_submit() {
+    asm volatile("fabric.submit;\n" ::: "memory");
+}
+
+inline __device__ __mbarrier_token_t fabric_arrive_expect_tx(__mbarrier_t *barrier, uint32_t txCount) {
+    __mbarrier_token_t token;
+    uint32_t bar = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;\n"
+                 : "=l"(token)
+                 : "r"(bar), "r"(txCount)
+                 : "memory");
+    return token;
+}
+
+inline __device__ bool fabric_try_wait_primary(__mbarrier_t *barrier, __mbarrier_token_t token,
+                                               bool *reportError) {
+    uint32_t bar = static_cast<uint32_t>(__cvta_generic_to_shared(barrier));
+    int complete;
+    int errorPred;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .pred q;\n\t"
+        "mbarrier.try_wait.phase_type::primary.acquire.cta.shared::cta.b64 p|q, [%2], %3;\n\t"
+        "selp.b32 %0, 1, 0, p;\n\t"
+        "selp.b32 %1, 1, 0, q;\n\t"
+        "}\n"
+        : "=r"(complete), "=r"(errorPred)
+        : "r"(bar), "l"(token)
+        : "memory");
+    if (complete) {
+        *reportError = (errorPred != 0);
+    }
+    return complete != 0;
+}
+#endif // __CUDA_ARCH__ >= 1000
+
+template<auto fabric_try_put_func>
+__global__ void cftPutKernel(unsigned long long loopCount, char* src,
+                             unsigned int dstLeId, size_t dstLeOffset, size_t size, int tmaChunkSize) {
+#if __CUDA_ARCH__ >= 1000
+    assert(tmaChunkSize > 0 && tmaChunkSize % 16 == 0 && "CFT chunk size must be a positive multiple of 16B");
+    assert(size % 16 == 0 && "CFT put kernel requires copy size to be a multiple of 16B");
+    assert(blockDim.x == 1 && "cftPutKernel must be launched with one thread per block.");
+
+    extern __shared__ char smem_bytes[];
+    char *buf = smem_bytes;
+    __mbarrier_t *tmaBar = reinterpret_cast<__mbarrier_t*>(smem_bytes + CFT_TMA_BAR_OFFSET(tmaChunkSize));
+    __mbarrier_t *fabricBar = reinterpret_cast<__mbarrier_t*>(smem_bytes + CFT_FABRIC_BAR_OFFSET(tmaChunkSize));
+
+    __mbarrier_init(tmaBar, 1);
+    mbarrier_init_v1(fabricBar, 1);
+
+    size_t block_stride = size_t(tmaChunkSize) * size_t(blockIdx.x);
+    size_t grid_stride = size_t(gridDim.x) * size_t(tmaChunkSize);
+    for (unsigned long long loop = 0; loop < loopCount; loop++) {
+        for (size_t i = block_stride; i < size; i += grid_stride) {
+            size_t bytesToCopy = tmaChunkSize;
+            if (i + bytesToCopy > size) {
+                bytesToCopy = size - i;
+            }
+            cp_async_bulk_global_to_shared(buf, src + i, tmaBar, bytesToCopy);
+            __mbarrier_token_t loadToken = barrier_arrive1_tx(tmaBar, bytesToCopy);
+            while (!barrier_try_wait_token(tmaBar, loadToken)) {}
+
+            fabric_try_put_func(dstLeId, /*dstDataOff=*/dstLeOffset + i, buf, bytesToCopy, fabricBar);
+
+            fabric_submit();
+            __mbarrier_token_t putToken = fabric_arrive_expect_tx(fabricBar, bytesToCopy / 16);
+
+            bool reportError = false;
+            while (!fabric_try_wait_primary(fabricBar, putToken, &reportError)) {}
+            if (reportError) {
+                printf("CFT write: fabric error reported at offset %llu (leId %u)\n",
+                       (unsigned long long) i, dstLeId);
+            }
+        }
+    }
+
+    __threadfence_system();
+#endif // __CUDA_ARCH__ >= 1000
+}
+
+__global__ void cftGetKernel(unsigned long long loopCount, char* dst,
+                             unsigned int srcLeId, size_t srcLeOffset, size_t size, int tmaChunkSize) {
+#if __CUDA_ARCH__ >= 1000
+    assert(tmaChunkSize > 0 && tmaChunkSize % 16 == 0 && "CFT chunk size must be a positive multiple of 16B");
+    assert(size % 16 == 0 && "CFT get kernel requires copy size to be a multiple of 16B");
+    assert(blockDim.x == 1 && "cftGetKernel must be launched with one thread per block.");
+
+    extern __shared__ char smem_bytes[];
+    char *buf = smem_bytes;
+    __mbarrier_t *fabricBar = reinterpret_cast<__mbarrier_t*>(smem_bytes + CFT_FABRIC_BAR_OFFSET(tmaChunkSize));
+
+    mbarrier_init_v1(fabricBar, 1);
+
+    size_t block_stride = size_t(tmaChunkSize) * size_t(blockIdx.x);
+    size_t grid_stride = size_t(gridDim.x) * size_t(tmaChunkSize);
+    for (unsigned long long loop = 0; loop < loopCount; loop++) {
+        for (size_t i = block_stride; i < size; i += grid_stride) {
+            size_t bytesToCopy = tmaChunkSize;
+            if (i + bytesToCopy > size) {
+                bytesToCopy = size - i;
+            }
+            fabric_try_get(buf, srcLeId, /*srcDataOff=*/srcLeOffset + i, bytesToCopy, fabricBar);
+
+            fabric_submit();
+            __mbarrier_token_t getToken = fabric_arrive_expect_tx(fabricBar, bytesToCopy);
+
+            bool reportError = false;
+            while (!fabric_try_wait_primary(fabricBar, getToken, &reportError)) {}
+            if (reportError) {
+                printf("CFT read: fabric error reported at offset %llu (leId %u)\n",
+                       (unsigned long long) i, srcLeId);
+            }
+
+            cp_async_bulk_shared_to_global(dst + i, buf, bytesToCopy);
+            cp_async_bulk_commit_group();
+            cp_async_bulk_wait_all_read();
+        }
+    }
+
+    __threadfence_system();
+#endif // __CUDA_ARCH__ >= 1000
+}
+
+__global__ void cftPullredKernel(unsigned long long loopCount, char* dst,
+                                 unsigned int srcLeId, size_t srcLeOffset, size_t size, int tmaChunkSize) {
+#if __CUDA_ARCH__ >= 1000
+    assert(tmaChunkSize > 0 && tmaChunkSize % 16 == 0 && "CFT chunk size must be a positive multiple of 16B");
+    assert(size % 16 == 0 && "CFT pullred kernel requires copy size to be a multiple of 16B");
+    assert(blockDim.x == 32 && "cftPullredKernel must be launched with one full warp per block.");
+
+    extern __shared__ char smem_bytes[];
+    char *buf = smem_bytes;
+    __mbarrier_t *fabricBar = reinterpret_cast<__mbarrier_t*>(smem_bytes + CFT_FABRIC_BAR_OFFSET(tmaChunkSize));
+
+    if (threadIdx.x == 0) {
+        mbarrier_init_v1(fabricBar, 1);
+    }
+    __syncwarp();
+
+    size_t block_stride = size_t(tmaChunkSize) * size_t(blockIdx.x);
+    size_t grid_stride = size_t(gridDim.x) * size_t(tmaChunkSize);
+    for (unsigned long long loop = 0; loop < loopCount; loop++) {
+        for (size_t i = block_stride; i < size; i += grid_stride) {
+            size_t bytesToCopy = tmaChunkSize;
+            if (i + bytesToCopy > size) {
+                bytesToCopy = size - i;
+            }
+            fabric_try_pullred_multicast(buf, srcLeId, /*srcDataOff=*/srcLeOffset + i, bytesToCopy, fabricBar);
+
+            fabric_submit();
+
+            if (threadIdx.x == 0) {
+                __mbarrier_token_t pullToken = fabric_arrive_expect_tx(fabricBar, bytesToCopy);
+
+                bool reportError = false;
+                while (!fabric_try_wait_primary(fabricBar, pullToken, &reportError)) {}
+                if (reportError) {
+                    printf("CFT pullred: fabric error reported at offset %llu (leId %u)\n",
+                           (unsigned long long) i, srcLeId);
+                }
+
+                cp_async_bulk_shared_to_global(dst + i, buf, bytesToCopy);
+                cp_async_bulk_commit_group();
+                cp_async_bulk_wait_all_read();
+            }
+            // The next collective pullred overwrites buf; lanes 1-31 must not issue it
+            // before lane 0's writeback has read buf.
+            __syncwarp();
+        }
+    }
+
+    __threadfence_system();
+#endif // __CUDA_ARCH__ >= 1000
+}
+
+template<auto kernel>
+static void launchCFTKernel(CUdeviceptr localBuffer, CUlogicalEndpointId remoteEndpointId,
+                            size_t remoteEndpointOffset, size_t size, CUstream stream,
+                            unsigned long long loopCount, int numThreadsPerBlock = 1) {
+    int numBlocks = std::min(NvLoom::getLocalMultiprocessorCount(), 128);
+    int tmaChunkSize = NvLoom::getTmaChunkSize();
+
+    // Staging buffer plus its two 16B-aligned mbarriers
+    int smemBytes = CFT_SMEM_BYTES(tmaChunkSize);
+    ASSERT(tmaChunkSize > 0 && tmaChunkSize % 16 == 0);
+    ASSERT(smemBytes <= (int)MAX_SMEM_CAPACITY_SIZE);
+    CUDA_ASSERT(cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+
+    cudaLaunchConfig_t config = {0};
+    config.gridDim = dim3(numBlocks, 1, 1);
+    config.blockDim = dim3(numThreadsPerBlock, 1, 1);
+    config.dynamicSmemBytes = static_cast<unsigned int>(smemBytes);
+    config.stream = stream;
+    cudaLaunchAttribute cudaAttr;
+    cudaAttr.id = cudaLaunchAttributeNvlinkUtilCentricScheduling;
+    cudaAttr.val.nvlinkUtilCentricScheduling = 1;
+    config.attrs = &cudaAttr;
+    config.numAttrs = 1;
+
+    CUDA_ASSERT(cudaLaunchKernelEx(&config, kernel,
+                                   loopCount, (char *) localBuffer, (unsigned int) remoteEndpointId, remoteEndpointOffset, size, tmaChunkSize));
+}
+
+void copyKernelCFTRead(CUdeviceptr dstBuffer, CUlogicalEndpointId srcEndpointId, size_t srcEndpointOffset, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCFTKernel<cftGetKernel>(dstBuffer, srcEndpointId, srcEndpointOffset, size, stream, loopCount);
+}
+
+void copyKernelCFTWrite(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCFTKernel<cftPutKernel<fabric_try_put>>(srcBuffer, dstEndpointId, dstEndpointOffset, size, stream, loopCount);
+}
+
+void copyKernelCFTWriteMulticast(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCFTKernel<cftPutKernel<fabric_try_put_multicast>>(srcBuffer, dstEndpointId, dstEndpointOffset, size, stream, loopCount);
+}
+
+void copyKernelCFTReduceMulticast(CUlogicalEndpointId dstEndpointId, size_t dstEndpointOffset, CUdeviceptr srcBuffer, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCFTKernel<cftPutKernel<fabric_try_red_multicast>>(srcBuffer, dstEndpointId, dstEndpointOffset, size, stream, loopCount);
+}
+
+void copyKernelCFTPullredMulticast(CUdeviceptr dstBuffer, CUlogicalEndpointId srcEndpointId, size_t srcEndpointOffset, size_t size, CUstream stream, unsigned long long loopCount) {
+    launchCFTKernel<cftPullredKernel>(dstBuffer, srcEndpointId, srcEndpointOffset, size, stream, loopCount, 32);
+}
+#endif
 
 __global__ void spinKernelDeviceMultistage(volatile int *latch1, volatile int *latch2, const unsigned long long timeoutClocks) {
     if (latch1) {
@@ -439,7 +764,7 @@ __global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int gr
 }
 
 void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupId, int groupSize) {
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 gridDim(fillCheckNumBlocks, 1, 1);
     dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     patternFillKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, groupId, groupSize);
     CUDA_ASSERT(cudaPeekAtLastError());
@@ -450,15 +775,15 @@ void zeroOutBuffer(void *ptr, size_t size, CUstream stream) {
 }
 
 void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, MemoryPurpose memoryPurpose) {
-    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE || copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) {
         memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) {
         if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
             memsetBuffer(ptr, seed, size, stream, MPIWrapper::getWorldRank(), MPIWrapper::getWorldSize());
         } else {
             zeroOutBuffer(ptr, size, stream);
         }
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE) {
         if (memoryPurpose == MemoryPurpose::MEMORY_SOURCE) {
             memsetBuffer(ptr, seed, size, stream, 0, 1);
         } else {
@@ -512,7 +837,7 @@ unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream
     }
     CU_ASSERT(cuMemsetD8((CUdeviceptr) errorCount, 0, sizeof(*errorCount)));
 
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 gridDim(fillCheckNumBlocks, 1, 1);
     dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     patternCheckKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount, groupSize, multiplier);
     CUDA_ASSERT(cudaPeekAtLastError());
@@ -525,11 +850,11 @@ unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream
 }
 
 unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType copyType, int iterations) {
-    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) {
+    if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE || copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) {
         return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), 1);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_ALL || copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) {
         return checkBuffer(ptr, seed, size, stream, MPIWrapper::getWorldSize(), iterations);
-    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
+    } else if (copyType == COPY_TYPE_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE) {
         return checkBuffer(ptr, seed, size, stream, 1, iterations);
     } else if (copyType == COPY_TYPE_LATENCY) {
         // Latency measurement is read-only, so there's nothing to verify
@@ -552,7 +877,7 @@ __global__ void pointerChaseFillKernel(size_t* dst, size_t bufferSize) {
 }
 
 void pointerChaseFill(void *ptr, size_t size, CUstream stream) {
-    dim3 gridDim(NvLoom::getLocalMultiprocessorCount(), 1, 1);
+    dim3 gridDim(fillCheckNumBlocks, 1, 1);
     dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
     pointerChaseFillKernel<<<gridDim, blockDim, 0, stream>>>((size_t *)ptr, size);
     CUDA_ASSERT(cudaPeekAtLastError());
@@ -621,9 +946,16 @@ void preloadKernels(int localDevice) {
     cudaFuncGetAttributes(&unused, &patternFillKernel);
     cudaFuncGetAttributes(&unused, &patternCheckKernel);
     cudaFuncGetAttributes(&unused, &getSmIdsKernel);
-    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global>);
-    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global_multicast>);
-    cudaFuncGetAttributes(&unused, &memcpyKernelTma<TMA_CHUNK_SIZE_BYTES, cp_async_bulk_shared_to_global_multicast_red>);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<cp_async_bulk_shared_to_global>);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<cp_async_bulk_shared_to_global_multicast>);
+    cudaFuncGetAttributes(&unused, &memcpyKernelTma<cp_async_bulk_shared_to_global_multicast_red>);
+#if CUDA_VERSION >= 13030
+    cudaFuncGetAttributes(&unused, &cftPutKernel<fabric_try_put>);
+    cudaFuncGetAttributes(&unused, &cftPutKernel<fabric_try_put_multicast>);
+    cudaFuncGetAttributes(&unused, &cftPutKernel<fabric_try_red_multicast>);
+    cudaFuncGetAttributes(&unused, &cftGetKernel);
+    cudaFuncGetAttributes(&unused, &cftPullredKernel);
+#endif
 }
 
 // This utility function has to be defined in a .cu file because it uses nvcc compiler macros
@@ -633,4 +965,8 @@ std::string getNvccVersion() {
 
 bool tmaMulticastSupported() {
     return TMA_MULTICAST_SUPPORTED;
+}
+
+bool cftSupported() {
+    return CFT_SUPPORTED;
 }

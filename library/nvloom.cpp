@@ -77,6 +77,7 @@ static bool isEventDone(CUevent event) {
 }
 
 Benchmark::Benchmark(std::vector<Copy> _copies) : copies(_copies) {
+    ASSERT(copies.size() > 0);
     filteredCopies = getFilteredCopies();
     filteredStreams.resize(filteredCopies.size());
     filteredStartEvents.resize(filteredCopies.size());
@@ -123,12 +124,13 @@ Benchmark::~Benchmark() {
 }
 
 std::vector<Copy> Benchmark::getFilteredCopies() {
+    std::vector<Copy> result;
     for (auto copy : copies) {
         if (MPIWrapper::getWorldRank() == copy.executingMPIrank) {
-            filteredCopies.push_back(copy);
+            result.push_back(copy);
         }
     }
-    return filteredCopies;
+    return result;
 }
 
 void Benchmark::verifyBuffers() {
@@ -168,6 +170,18 @@ void Benchmark::doMemcpyWarmup(Copy& copy, CUstream hStream) {
         copyKernelMulticastTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
     } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
         copyKernelMulticastRedTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+#if CUDA_VERSION >= 13030
+    } else if (copy.copyType == COPY_TYPE_CFT_READ) {
+        copyKernelCFTRead((CUdeviceptr) copy.dst->ptr, copy.src->getEndpointId(), copy.src->getEndpointOffset(), copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_CFT_WRITE) {
+        copyKernelCFTWrite(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_CFT_WRITE_MULTICAST) {
+        copyKernelCFTWriteMulticast(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE || copy.copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) {
+        copyKernelCFTReduceMulticast(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+    } else if (copy.copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) {
+        copyKernelCFTPullredMulticast((CUdeviceptr) copy.dst->ptr, copy.src->getEndpointId(), copy.src->getEndpointOffset(), copy.src->allocationSize, hStream, WARMUP_ITERATIONS);
+#endif
     } else {
         ASSERT(0);
     }
@@ -203,6 +217,18 @@ unsigned long long Benchmark::doMemcpyInSpinKernel(Copy& copy, CUstream hStream,
         copyKernelMulticastTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
     } else if (copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL || copy.copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
         copyKernelMulticastRedTma((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+#if CUDA_VERSION >= 13030
+    } else if (copy.copyType == COPY_TYPE_CFT_READ) {
+        copyKernelCFTRead((CUdeviceptr) copy.dst->ptr, copy.src->getEndpointId(), copy.src->getEndpointOffset(), copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_CFT_WRITE) {
+        copyKernelCFTWrite(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_CFT_WRITE_MULTICAST) {
+        copyKernelCFTWriteMulticast(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE || copy.copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) {
+        copyKernelCFTReduceMulticast(copy.dst->getEndpointId(), copy.dst->getEndpointOffset(), (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream, loopCount);
+    } else if (copy.copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) {
+        copyKernelCFTPullredMulticast((CUdeviceptr) copy.dst->ptr, copy.src->getEndpointId(), copy.src->getEndpointOffset(), copy.src->allocationSize, hStream, loopCount);
+#endif
     } else {
         ASSERT(0);
     }
@@ -225,14 +251,14 @@ std::vector<double> Benchmark::calculateBandwidths() {
         if (filteredCopies[i].copyType == COPY_TYPE_LATENCY) {
             filteredBandwidths[i] = (double) elapsedMs * (double) 1e6 / (double)filteredCopies[i].iterations;
         } else {
-            filteredBandwidths[i] = filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000 * 1000 * elapsedMs);
+            filteredBandwidths[i] = (double)filteredCopies[i].src->allocationSize * filteredCopies[i].iterations / (1000.0 * 1000.0 * elapsedMs);
         }
     }
 
     // exchange bandwidths
     int currentIndex = 0;
     for (auto copy : copies) {
-        double exchange;
+        double exchange = 0.0;
         if (MPIWrapper::getWorldRank() == copy.executingMPIrank) {
             exchange = filteredBandwidths[currentIndex];
             currentIndex++;
@@ -257,6 +283,7 @@ void Benchmark::blockStreams() {
     for (int i = 0; i < filteredCopies.size(); i++) {
         Copy &copy = filteredCopies[i];
         CU_ASSERT(cuStreamWriteValue32(filteredStreams[i], (CUdeviceptr) copy.counter->ptr, (int) BenchmarkState::SYNCHRONIZE, 0));
+        // Only rank belonging to copy[0] executes the host part of the spin kernel
         CU_ASSERT(spinKernelMultistage((MPIWrapper::getWorldRank() == copies[0].executingMPIrank) ? (volatile int *) blockingVarHost->ptr : nullptr,
                                         (volatile int *) blockingVarDevice->ptr,
                                         filteredStreams[i]));
@@ -311,7 +338,9 @@ void Benchmark::scheduleWorkPostBlock() {
 static bool isLoadSustainmentSupported(Copy& copy) {
     return copy.copyType != COPY_TYPE_MULTICAST_RED_SINGLE && copy.copyType != COPY_TYPE_MULTICAST_RED_ALL &&
         copy.copyType != COPY_TYPE_TMA_MULTICAST_RED_SINGLE && copy.copyType != COPY_TYPE_TMA_MULTICAST_RED_ALL &&
-        copy.copyType != COPY_TYPE_MULTICAST_LD_REDUCE && copy.copyType != COPY_TYPE_LATENCY;
+        copy.copyType != COPY_TYPE_MULTICAST_LD_REDUCE && copy.copyType != COPY_TYPE_LATENCY &&
+        copy.copyType != COPY_TYPE_CFT_MULTICAST_RED_SINGLE && copy.copyType != COPY_TYPE_CFT_MULTICAST_RED_ALL &&
+        copy.copyType != COPY_TYPE_CFT_MULTICAST_PULLRED;
 }
 
 static int countCopiesWithLoadSustainmentSupport(std::vector<Copy> &copies) {
@@ -498,7 +527,12 @@ static nvmlDevice_t getNvmlDevice(int device) {
     memcpy(&arg.value.bytes, &uuid, sizeof(uuid));
 
     nvmlDevice_t nvmlDev;
-    NVML_ASSERT(nvmlDeviceGetHandleByUUIDV(&arg, &nvmlDev));
+    nvmlReturn_t result = nvmlDeviceGetHandleByUUIDV(&arg, &nvmlDev);
+    if (result != NVML_SUCCESS) {
+        char pciBusId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
+        CU_ASSERT(cuDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), device));
+        NVML_ASSERT(nvmlDeviceGetHandleByPciBusId_v2(pciBusId, &nvmlDev));
+    }
 
     return nvmlDev;
 }
@@ -665,6 +699,13 @@ bool filterCopyType(CopyType copyType) {
         case COPY_TYPE_TMA_MULTICAST_RED_ALL:
         case COPY_TYPE_TMA_MULTICAST_RED_SINGLE:
             return tmaMulticastSupported() && (getMajorComputeCapability() >= 9);
+        case COPY_TYPE_CFT_READ:
+        case COPY_TYPE_CFT_WRITE:
+        case COPY_TYPE_CFT_WRITE_MULTICAST:
+        case COPY_TYPE_CFT_MULTICAST_RED_SINGLE:
+        case COPY_TYPE_CFT_MULTICAST_RED_ALL:
+        case COPY_TYPE_CFT_MULTICAST_PULLRED:
+            return cftSupported() && (getMajorComputeCapability() >= 9);
     }
     return false;
 }
@@ -692,6 +733,12 @@ std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) return "tma_mc";
     if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) return "tma_mc_red_all";
     if (copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) return "tma_mc_red_single";
+    // TODO: this needs to be updated for CSV testcases
+    if (copyType == COPY_TYPE_CFT_READ) return "cft";
+    if (copyType == COPY_TYPE_CFT_WRITE) return "cft";
+    if (copyType == COPY_TYPE_CFT_WRITE_MULTICAST) return "cft_mc";
+    if ( copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) return "cft_mc_red";
+    if (copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) return "cft_mc_pullred";
     throw std::runtime_error("Invalid copy type");
 }
 
@@ -706,5 +753,33 @@ CopyType getCopyType(std::string name) {
     if (name == "tma_mc") return COPY_TYPE_TMA_MULTICAST_WRITE;
     if (name == "tma_mc_red_all") return COPY_TYPE_TMA_MULTICAST_RED_ALL;
     if (name == "tma_mc_red_single") return COPY_TYPE_TMA_MULTICAST_RED_SINGLE;
+    if (name == "cft_read") return COPY_TYPE_CFT_READ;
+    if (name == "cft_write") return COPY_TYPE_CFT_WRITE;
+    if (name == "cft_mc") return COPY_TYPE_CFT_WRITE_MULTICAST;
+    if (name == "cft_mc_red_single") return COPY_TYPE_CFT_MULTICAST_RED_SINGLE;
+    if (name == "cft_mc_red_all") return COPY_TYPE_CFT_MULTICAST_RED_ALL;
+    if (name == "cft_mc_pullred") return COPY_TYPE_CFT_MULTICAST_PULLRED;
     throw std::runtime_error("Invalid copy type");
+}
+
+std::string getDriverVersion() {
+    NVML_ASSERT(nvmlInit());
+    char driverVersion[NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
+    NVML_ASSERT(nvmlSystemGetDriverVersion(driverVersion, NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE));
+    return driverVersion;
+}
+
+std::string getCudaVersion() {
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    int majorVersion = driverVersion / 1000;
+    int minorVersion = (driverVersion % 1000) / 10;
+    return std::to_string(majorVersion) + "." + std::to_string(minorVersion);
+}
+
+int getMajorDriverVersion() {
+    // NVML returns driver version in the format "X.Y"
+    // Trim it down and only return the major version
+    std::string driverVersion = getDriverVersion();
+    return std::stoi(driverVersion.substr(0, driverVersion.find('.')));
 }

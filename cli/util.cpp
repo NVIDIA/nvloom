@@ -32,7 +32,7 @@
 
 static std::string getPaddedProcessId(int id) {
     // max printed number will be MPIWrapper::getWorldSize() - 1
-    int paddingSize = (int) log10(MPIWrapper::getWorldSize() - 1) + 1;
+    int paddingSize = MPIWrapper::getWorldSize() > 1 ? (int) log10(MPIWrapper::getWorldSize() - 1) + 1 : 1;
     std::stringstream s;
     s << std::setfill(' ') << std::setw(paddingSize) << id;
     return s.str();
@@ -83,9 +83,25 @@ int discoverRanks(std::map<std::string, std::vector<int>> &rackToProcessMap) {
     // It's not recommended to run more ranks per node than GPU count, but we want to make sure we handle it gracefully
     localDevice = localRank % deviceCount;
 
-    // Unconditionally emitting a warning, once per node
-    if (localRank == deviceCount) {
-        std::cout << "WARNING: there are more processes than GPUs on " << localHostname << ". Please reduce number of processes to match GPU count." << std::endl;
+    // Exchange GPU UUIDs to detect processes sharing the same GPU
+    CUdevice cuDev;
+    CU_ASSERT(cuDeviceGet(&cuDev, localDevice));
+    CUuuid localUuid;
+    CU_ASSERT(cuDeviceGetUuid_v2(&localUuid, cuDev));
+
+    std::vector<CUuuid> uuidExchange(MPIWrapper::getWorldSize());
+    MPI_Allgather(&localUuid, sizeof(CUuuid), MPI_BYTE, &uuidExchange[0], sizeof(CUuuid), MPI_BYTE, MPI_COMM_WORLD);
+
+    // Check for duplicate UUIDs — warn once per pair, only from the lower-ranked process
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
+        if (i == MPIWrapper::getWorldRank()) continue;
+        if (strncmp(localHostname, &hostnameExchange[i * STRING_LENGTH], STRING_LENGTH) == 0
+                && memcmp(&localUuid, &uuidExchange[i], sizeof(CUuuid)) == 0
+                && MPIWrapper::getWorldRank() < i) {
+            std::cout << "WARNING: processes " << MPIWrapper::getWorldRank() << " and " << i
+                      << " are sharing the same GPU on " << localHostname
+                      << ". Please reduce number of processes or adjust CUDA_VISIBLE_DEVICES." << std::endl;
+        }
     }
 
     // Exchange rack GUIDs
@@ -158,21 +174,6 @@ void OutputMatrix::incrementalPrint(int stage) {
     if (stage % dimX == (dimX - 1)) {
         OUTPUT << "\n";
     }
-}
-
-std::string getDriverVersion() {
-    NVML_ASSERT(nvmlInit());
-    char driverVersion[NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE];
-    NVML_ASSERT(nvmlSystemGetDriverVersion(driverVersion, NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE));
-    return driverVersion;
-}
-
-std::string getCudaVersion() {
-    int driverVersion = 0;
-    CU_ASSERT(cuDriverGetVersion(&driverVersion));
-    int majorVersion = driverVersion / 1000;
-    int minorVersion = (driverVersion % 1000) / 10;
-    return std::to_string(majorVersion) + "." + std::to_string(minorVersion);
 }
 
 size_t getBufferSizeInBytes(std::string bufferSizeStr) {

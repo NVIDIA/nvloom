@@ -52,11 +52,12 @@ Current suites:
 1. `pairwise` - typical O(n^2), one pair at a time testing
 2. `fabric-stress` - testcases where every single GPU is writing/reading to/from some other GPU at the same time
 3. `all-to-one` - testcases where multiple GPUs access memory on a single GPU
-4. `multicast` - multicast benchmarks
-5. `egm` - typical O(n^2) pairwise testing for EGM
-6. `gpu-to-rack` - for each GPU bandwidth is measured against a constant number of peer GPUs. Those GPUs are selected in a randomized manner. Median is reported. If one GPU has a slower connection to the fabric, it will show up on all its benchmarks, but it should have minimal impact on measurement of other GPUs. This is designed to replicate data from typical pairwise benchmarks, but in linear runtime.
-7. `rack-to-rack` - this suite focuses on benchmarking rack-to-rack communication, pushing as many simultaneous copies as possible
-8. `egm-gpu-to-rack` - implements all tests from `egm` suite in the more scalable `gpu-to-rack` fashion
+4. `rack-aware-all-to-one` - testcases where multiple GPUs access memory on a single representative GPU per rack
+5. `multicast` - multicast benchmarks
+6. `egm` - typical O(n^2) pairwise testing for EGM
+7. `gpu-to-rack` - for each GPU bandwidth is measured against a constant number of peer GPUs. Those GPUs are selected in a randomized manner. Median is reported. If one GPU has a slower connection to the fabric, it will show up on all its benchmarks, but it should have minimal impact on measurement of other GPUs. This is designed to replicate data from typical pairwise benchmarks, but in linear runtime.
+8. `rack-to-rack` - this suite focuses on benchmarking rack-to-rack communication, pushing as many simultaneous copies as possible
+9. `egm-gpu-to-rack` - implements all tests from `egm` suite in the more scalable `gpu-to-rack` fashion
 
 Build it with
 
@@ -329,6 +330,12 @@ The default is 20 bins.
 
 Controlled with `--histogram_bins` option.
 
+### --seed
+
+The `--seed` option allows you to specify the seed value used to initialize the random number generator, which is used in a multitude of tests. There is no default seed value. If not specified, it is set to a random value. 
+
+Controlled with the `--seed` option.
+
 # Testcase reference
 
 Each testcase is defined by a combination memcopy pattern, memcopy parameters, and source/destination memory types.
@@ -395,6 +402,14 @@ Let's assume one GPU is slower than others, and any copy involving is slower. In
 
 This makes GPU-to-rack testing effective at identifying problematic GPUs while being resilient to occasional slow measurements.
 
+### Fully-random
+
+Fully-random runs on all GPUs in the MPI domain. Each GPU performs a copy on a randomly selected peer, which can be any GPU but itself. A GPU can serve as the peer for multiple copies. 
+
+The results of this pattern will vary depending on the GPU pairings. Naturally, some pairings on the MPI domain will be slower than others. 
+
+![Example of fully random traffic pattern](docs/fully_random.png)
+
 ### Bisect
 
 Bisect runs on all GPUs in the MPI domain. Let's assume we have N GPUs involved.
@@ -404,6 +419,20 @@ GPU `X` will write/read to/from GPU `(X+NUM_GPU/2)%NUM_GPU`.
 This effectively divides the GPUs into two equal sized groups of GPUs, with bidirectional memcopy executed between consecutive pairs of GPUs from both groups.
 
 ![Diagram of bisect traffic pattern](docs/bisect_testing.png)
+
+### Random-permutation
+
+Random-permutation runs on all GPUs in the MPI domain. The GPUs are randomly permuted and results will vary depending on the ordering. 
+
+There are two variants of this pattern:
+
+The ring variant pairs the permuted GPUs in a cyclic manner. The `nth` GPU will be the destination of the `(n-1)th` GPU and the source of the `(n+1)th` GPU. 
+
+![Example of random permutation ring pattern](docs/random_permutation_ring.png)
+
+The bisect variant applies the bisect pattern to random permutation. 
+
+![Example of random permutation bisect pattern](docs/random_permutation_bisect.png)
 
 ### Rack-to-rack
 

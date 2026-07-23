@@ -57,9 +57,9 @@ public:
 template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
 Copy getLatency(CopyDescription desc) {
     if (desc.src.type == "device") {
-        return Latency<unicastAllocator>(desc.src.location, desc.dst.location);
+        return Latency<unicastAllocator>(desc.src.location, desc.dst.location, desc.iterationCount);
     } else if (desc.src.type == "egm") {
-        return Latency<egmAllocator>(desc.src.location, desc.dst.location);
+        return Latency<egmAllocator>(desc.src.location, desc.dst.location, desc.iterationCount);
     } else {
         throw std::runtime_error("Invalid allocation type: " + desc.src.type);
     }

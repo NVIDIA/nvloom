@@ -145,6 +145,15 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
         throw std::runtime_error("Multicast reductions are not supported for CSV input testcase");
     }
 
+    if (type == COPY_TYPE_CFT_READ ||
+        type == COPY_TYPE_CFT_WRITE ||
+        type == COPY_TYPE_CFT_WRITE_MULTICAST ||
+        type == COPY_TYPE_CFT_MULTICAST_RED_SINGLE ||
+        type == COPY_TYPE_CFT_MULTICAST_RED_ALL ||
+        type == COPY_TYPE_CFT_MULTICAST_PULLRED) {
+        throw std::runtime_error("CFT copy types are not supported for CSV input testcase: " + ceSmMulticastStr);
+    }
+
     measurementId = getInt(measurementIdStr, "measurement ID");
     gpuSrc = getInt(gpuSrcStr, "GPU source ID");
     gpuDst = getInt(gpuDstStr, "GPU destination ID");
@@ -157,6 +166,9 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
         }
         buffersz = 0;
     } else {
+        if (bufferszStr.empty()) {
+            throw std::runtime_error("Buffer size field must be populated in CSV row");
+        }
         if (std::isdigit(bufferszStr.back())) {
             buffersz = getSizeT(bufferszStr, "buffer size");
         } else {
@@ -275,5 +287,5 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::writeCsvTo
 }
 
 template class csv_pattern<MultinodeMemoryAllocationUnicast, MultinodeMemoryAllocationEGM, MultinodeMemoryAllocationMulticast>;
-template class csv_pattern<AllocationPool<MultinodeMemoryAllocationUnicast>, AllocationPool<MultinodeMemoryAllocationEGM>, MulticastPool>;
+template class csv_pattern<AllocationPool<MultinodeMemoryAllocationUnicast>, AllocationPool<MultinodeMemoryAllocationEGM>, MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>>;
 template class csv_pattern<MultinodeMemoryPoolAllocationUnicast, MultinodeMemoryPoolAllocationEGM, MultinodeMemoryAllocationMulticastCudaPool>;

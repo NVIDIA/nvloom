@@ -19,6 +19,7 @@
 #define LIB_H_
 
 #include <vector>
+#include <algorithm>
 #include <cuda.h>
 #include <iostream>
 #include <sstream>
@@ -36,6 +37,7 @@ constexpr unsigned long long DEFAULT_ITERATIONS = 16;
 constexpr unsigned long long DEFAULT_LATENCY_ITERATIONS = 40000;
 constexpr unsigned long long WARMUP_LATENCY_ITERATIONS = 256;
 constexpr size_t DEFAULT_BUFFER_SIZE_MIB = 512;
+constexpr size_t DEFAULT_TMA_CHUNK_SIZE_KB = 192;
 
 constexpr unsigned long long LATENCY_JUMP_SIZE = 128;
 
@@ -180,6 +182,8 @@ private:
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
     static inline std::vector<int> localSMIds;
     static inline bool spinKernelsEnabled = true;
+    static inline int copyKernelBlockCountOverride = 0;
+    static inline int tmaChunkSize = DEFAULT_TMA_CHUNK_SIZE_KB * 1024;
     static inline std::vector<Copy> currentCopies;
     static inline std::map<int, std::string> processNameMap;
 public:
@@ -189,6 +193,10 @@ public:
     static CUdevice getLocalCuDevice() { return localCuDevice; };
     static CUcontext getLocalCtx() { return localCtx; };
     static int getLocalMultiprocessorCount() { return localMultiprocessorCount; };
+    // Number of thread blocks used by copy kernels. Defaults to min(SM count, 128),
+    // but can be overridden via setCopyKernelBlockCountOverride().
+    static int getCopyKernelBlockCount() { return copyKernelBlockCountOverride > 0 ? copyKernelBlockCountOverride : std::min(localMultiprocessorCount, 128); };
+    static int getTmaChunkSize() { return tmaChunkSize; };
     static int getLocalClockRate() { return localClockRate; };
     static int getLocalCpuNumaNode() { return localCpuNumaNode; };
     static std::vector<int>& getLocalSMIds() { return localSMIds; };
@@ -196,12 +204,16 @@ public:
     static unsigned long long getDefaultIterationCount() { return DEFAULT_ITERATIONS; };
     static unsigned long long getDefaultLatencyIterationCount() { return DEFAULT_LATENCY_ITERATIONS; };
     static size_t getDefaultBufferSizeInMiB() { return DEFAULT_BUFFER_SIZE_MIB; };
+    static size_t getDefaultTMAChunkSizeInKB() { return DEFAULT_TMA_CHUNK_SIZE_KB; };
 
     static std::map<std::string, std::vector<int> > getRackToProcessMap() { return rackToProcessMap; };
     static void initialize(int _localDevice, std::map<std::string, std::vector<int> > _rackToProcessMap = {});
     // Enable profiling by disabling spinKernels. This may reduce accuracy of performance results.
     // spinKernels will not be launched, but spinkernel-related memory allocations and memsets will still occur to minimize the changes in behavior.
     static void disableSpinKernels() { spinKernelsEnabled = false; }
+    // Override the number of thread blocks launched by copy kernels. A value <= 0 restores the default.
+    static void setCopyKernelBlockCountOverride(int count) { copyKernelBlockCountOverride = count; }
+    static void setTmaChunkSize(int chunkSize) { tmaChunkSize = chunkSize; };
     static void finalize();
     static bool executingCopies();
     static void setCurrentCopies(std::vector<Copy> _copies) { currentCopies = _copies; };
@@ -220,5 +232,9 @@ std::string getCopyDirectionName(CopyDirection copyDirection);
 CopyDirection getCopyDirection(std::string name);
 std::string getCopyTypeName(CopyType copyType);
 CopyType getCopyType(std::string name);
+
+std::string getDriverVersion();
+std::string getCudaVersion();
+int getMajorDriverVersion();
 
 #endif

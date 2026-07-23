@@ -113,17 +113,21 @@ public:
             OUTPUT << std::endl;
             OUTPUT << "Min " << name << " N/A " << unit << std::endl;
             OUTPUT << "Avg " << name << " N/A " << unit << std::endl;
+            OUTPUT << "Med " << name << " N/A " << unit << std::endl;
             OUTPUT << "Max " << name << " N/A " << unit << std::endl;
             OUTPUT << "Total " << name << " N/A " << unit << std::endl;
             OUTPUT << std::endl;
         } else {
             auto sum = std::reduce(filteredData.begin(), filteredData.end());
-            auto [min, max] = std::minmax_element(filteredData.begin(), filteredData.end());
+            std::sort(filteredData.begin(), filteredData.end());
+            size_t n = filteredData.size();
+            double median = (n % 2 == 0) ? (filteredData[n/2 - 1] + filteredData[n/2]) / 2.0 : filteredData[n/2];
             OUTPUT << std::endl;
             OUTPUT << std::fixed << std::setprecision(2);
-            OUTPUT << "Min " << name << " " << *min << " " << unit << std::endl;
-            OUTPUT << "Avg " << name << " " << sum / filteredData.size() << " " << unit << std::endl;
-            OUTPUT << "Max " << name << " " << *max << " " << unit << std::endl;
+            OUTPUT << "Min " << name << " " << filteredData.front() << " " << unit << std::endl;
+            OUTPUT << "Avg " << name << " " << sum / n << " " << unit << std::endl;
+            OUTPUT << "Med " << name << " " << median << " " << unit << std::endl;
+            OUTPUT << "Max " << name << " " << filteredData.back() << " " << unit << std::endl;
             OUTPUT << "Total " << name << " " << sum << " " << unit << std::endl;
             OUTPUT << std::endl;
         }
@@ -143,7 +147,7 @@ public:
         initialized[id] = true;
         if (buffering == BUFFERING_ENABLED && currentlyPrinted == id) {
             int i = id;
-            while (initialized[i] && i < dimX * dimY) {
+            while (i < dimX * dimY && initialized[i]) {
                 incrementalPrint(i);
                 currentlyPrinted = i + 1;
                 i++;
@@ -205,8 +209,5 @@ static inline size_t getSizeT(std::string str, std::string field) {
 }
 
 size_t getBufferSizeInBytes(std::string bufferSizeStr);
-
-std::string getDriverVersion();
-std::string getCudaVersion();
 
 #endif  // UTIL_H_
