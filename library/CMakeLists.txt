@@ -43,10 +43,10 @@ add_library(nvloom SHARED ${src})
 target_include_directories(nvloom PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${CMAKE_CURRENT_SOURCE_DIR}/library .)
 target_link_libraries(nvloom cuda nvidia-ml Boost::program_options)
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
-    set_target_properties(nvloom PROPERTIES CUDA_ARCHITECTURES "90;100;103")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.4")
+    set_target_properties(nvloom PROPERTIES CUDA_ARCHITECTURES "90;100;103;107")
 else()
-    set_target_properties(nvloom PROPERTIES CUDA_ARCHITECTURES "90;100")
+    set_target_properties(nvloom PROPERTIES CUDA_ARCHITECTURES "90;100;103")
 endif()
 
 find_package(MPI REQUIRED)

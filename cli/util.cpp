@@ -38,6 +38,29 @@ static std::string getPaddedProcessId(int id) {
     return s.str();
 }
 
+static std::string jsonEscape(const std::string &input) {
+    std::stringstream sstream;
+    for (unsigned char c : input) {
+        switch (c) {
+            case '\"': sstream << "\\\""; break;
+            case '\\': sstream << "\\\\"; break;
+            case '\b': sstream << "\\b"; break;
+            case '\f': sstream << "\\f"; break;
+            case '\n': sstream << "\\n"; break;
+            case '\r': sstream << "\\r"; break;
+            case '\t': sstream << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    sstream << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int) c
+                            << std::dec << std::setw(0) << std::setfill(' ');
+                } else {
+                    sstream << c;
+                }
+        }
+    }
+    return sstream.str();
+}
+
 static std::string getDeviceDisplayInfo(int deviceOrdinal) {
     std::stringstream sstream;
     CUdevice dev;
@@ -174,6 +197,92 @@ void OutputMatrix::incrementalPrint(int stage) {
     if (stage % dimX == (dimX - 1)) {
         OUTPUT << "\n";
     }
+}
+
+void OutputMatrix::setJsonOutputFile(std::string _jsonOutputFile) {
+    jsonOutputFile = _jsonOutputFile;
+    if (jsonOutputFile == "") {
+        return;
+    }
+
+    // Only rank 0 writes the JSON file, mirroring OUTPUT. Otherwise every rank
+    // would truncate and interleave writes into the same path.
+    if (MPIWrapper::getWorldRank() != 0) {
+        return;
+    }
+
+    jsonFile = std::ofstream(jsonOutputFile);
+    ASSERT(jsonFile.good());
+
+    jsonFile << "{" << std::endl;
+    jsonFile << "\"tests\": [" << std::endl;
+}
+
+void OutputMatrix::finalize() {
+    if (jsonFile.is_open()) {
+        jsonFile << "]" << std::endl;
+        jsonFile << "}" << std::endl;
+        jsonFile.close();
+    }
+}
+
+void OutputMatrix::printJson(StatisticsStrings stats) {
+    if (!jsonFile.is_open()) {
+        return;
+    }
+    if (jsonTestCount > 0) {
+        jsonFile << "," << std::endl;
+    }
+    jsonTestCount++;
+    jsonFile << "{" << std::endl;
+    jsonFile << "\"name\": \"" << jsonEscape(name) << "\"," << std::endl;
+    jsonFile << "\"unit\": \"" << jsonEscape(unit) << "\"," << std::endl;
+    jsonFile << "\"avg\": \"" << stats.avg << "\"," << std::endl;
+    jsonFile << "\"med\": \"" << stats.med << "\"," << std::endl;
+    jsonFile << "\"min\": \"" << stats.min << "\"," << std::endl;
+    jsonFile << "\"max\": \"" << stats.max << "\"," << std::endl;
+    jsonFile << "\"total\": \"" << stats.total << "\"," << std::endl;
+
+    jsonFile << "\"labelsX\": [" << std::endl;
+    for (int i = 0; i < labelsX.size(); i++) {
+        jsonFile << "\"" << jsonEscape(labelsX[i]) << "\"";
+        if (i < labelsX.size() - 1) {
+            jsonFile << ",";
+        }
+    }
+    jsonFile << "]," << std::endl;
+    jsonFile << "\"labelsY\": [" << std::endl;
+    for (int i = 0; i < labelsY.size(); i++) {
+        jsonFile << "\"" << jsonEscape(labelsY[i]) << "\"";
+        if (i < labelsY.size() - 1) {
+            jsonFile << ",";
+        }
+    }
+    jsonFile << "]," << std::endl;
+
+    jsonFile << "\"results\": [" << std::endl;
+    jsonFile << "[";
+
+    for (int i = 0; i < data.size(); i++) {
+        if (data[i] == 0) {
+            jsonFile << "\"N/A\"";
+        } else {
+            jsonFile << "\"" << data[i] << "\"";
+        }
+
+        if (i % dimX != (dimX - 1)) {
+            jsonFile << ",";
+        } else {
+            jsonFile << "]";
+            if (i < data.size() - 1) {
+                jsonFile << "," << std::endl << "[";
+            }
+        }
+    }
+
+    jsonFile << "]" << std::endl;
+
+    jsonFile << "}";
 }
 
 size_t getBufferSizeInBytes(std::string bufferSizeStr) {

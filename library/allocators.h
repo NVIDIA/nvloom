@@ -19,6 +19,8 @@
 #define ALLOCATORS_H_
 
 #include <map>
+#include <memory>
+#include <optional>
 #include "kernels.cuh"
 #include "enums.h"
 #include "nvloom.h"
@@ -33,6 +35,12 @@ public:
         {CU_MEM_LOCATION_TYPE_HOST_NUMA, {}}
     };
     static void initPools(CUmemLocationType location);
+};
+
+struct MemoryChunk {
+    void *ptr;
+    size_t size;
+    int localityDomainId;
 };
 
 class MemoryAllocation {
@@ -58,6 +66,15 @@ public:
 
     static std::string getName() {
         return "N/A";
+    }
+
+    virtual std::vector<MemoryChunk> getChunks() {
+        MemoryChunk defaultChunk = {ptr, allocationSize, -1};
+        return { defaultChunk };
+    }
+
+    virtual int getNumLocalityDomains() const {
+        return 1;
     }
 
     // copyType and memoryPurpose are optional arguments, and are only used in multicast reduction benchmarks
@@ -116,6 +133,42 @@ public:
     }
 };
 
+class LocalizedMultinodeMemoryAllocationUnicast : public MemoryAllocation {
+private:
+    int numLocalityDomains = 0;
+    CUmemAllocationHandleType handleType = {};
+    std::vector<CUmemGenericAllocationHandle> handles;
+    std::vector<CUmemFabricHandle> fhs;
+    std::vector<MemoryChunk> memoryChunks;
+    size_t roundedChunkSize;
+public:
+    LocalizedMultinodeMemoryAllocationUnicast(size_t _allocationSize, int _MPIrank);
+    ~LocalizedMultinodeMemoryAllocationUnicast();
+
+    std::vector<MemoryChunk> getChunks() override {
+        return memoryChunks;
+    }
+
+    int getNumLocalityDomains() const override {
+        return numLocalityDomains;
+    }
+
+    static bool filter();
+    static std::string getName() {
+        return "device";
+    }
+};
+
+class MemoryChunkAllocation : public MemoryAllocation {
+    std::shared_ptr<MemoryAllocation> parent;
+public:
+    int localityDomainId;
+    MemoryChunkAllocation(const MemoryChunk& chunk, int _MPIrank, std::shared_ptr<MemoryAllocation> _parent) : MemoryAllocation(_MPIrank), parent(_parent), localityDomainId(chunk.localityDomainId) {
+        ptr = chunk.ptr;
+        allocationSize = chunk.size;
+    }
+};
+
 class MultinodeMemoryAllocationEGM : public MultinodeMemoryAllocationBase {
 public:
     MultinodeMemoryAllocationEGM(size_t _allocationSize, int _MPIrank) : MultinodeMemoryAllocationBase(_allocationSize, _MPIrank, CU_MEM_LOCATION_TYPE_HOST_NUMA) {};
@@ -126,6 +179,90 @@ public:
     }
 };
 
+// Hands out non-overlapping, aligned ranges within a fixed-size region.
+// Only the free ranges are tracked (offset -> size); they are kept disjoint and never
+// adjacent by coalescing on release, so the whole region is a single entry when idle.
+class RangeAllocator {
+private:
+    std::map<size_t, size_t> freeRanges;
+    size_t regionSize;
+    size_t alignment;
+
+public:
+    RangeAllocator(size_t _regionSize, size_t _alignment);
+
+    // returns the offset of a range of at least size bytes
+    size_t allocate(size_t size);
+    void free(size_t offset, size_t size);
+
+    bool isFullyFree();
+};
+
+// Owns a unicast logical endpoint: it is created by the constructor and destroyed by
+// the destructor. Several allocations share a single endpoint, so the endpoint address
+// space has to be suballocated between them.
+class UnicastLogicalEndpoint {
+    private:
+#if CUDA_VERSION >= 13030
+        CUlogicalEndpointId endpointId = {};
+        int MPIrank;
+        std::optional<RangeAllocator> rangeAllocator;
+#endif
+
+    public:
+        UnicastLogicalEndpoint(int _MPIrank);
+
+        ~UnicastLogicalEndpoint();
+
+        UnicastLogicalEndpoint(const UnicastLogicalEndpoint &) = delete;
+        UnicastLogicalEndpoint &operator=(const UnicastLogicalEndpoint &) = delete;
+
+#if CUDA_VERSION >= 13030
+        CUlogicalEndpointId getEndpointId() const {
+            return endpointId;
+        }
+
+        size_t allocateRange(size_t size);
+        void freeRange(size_t offset, size_t size);
+#endif
+};
+
+// Hands out unicast logical endpoints, keyed by the rank owning the memory bound to them.
+// Constructing a pool object takes a reference to the endpoint of the given rank, creating
+// it if no one uses it yet; the endpoint is destroyed once the last reference is gone.
+class UnicastLogicalEndpointPool {
+    private:
+        static inline std::map<int, std::weak_ptr<UnicastLogicalEndpoint> > pool;
+        // references held by the pool itself, see setRetainEndpoints()
+        static inline std::map<int, std::shared_ptr<UnicastLogicalEndpoint> > retainedEndpoints;
+        static inline bool retainEndpoints = false;
+
+        std::shared_ptr<UnicastLogicalEndpoint> endpoint;
+
+    public:
+        UnicastLogicalEndpointPool(int MPIrank);
+
+        // Creating an endpoint takes a collective handshake, so under the reuse strategy the
+        // pool keeps the endpoints alive even while no allocation refers to them. Endpoints
+        // retained this way live until clear() is called.
+        static void setRetainEndpoints(bool _retainEndpoints);
+        static void clear();
+
+#if CUDA_VERSION >= 13030
+        CUlogicalEndpointId getEndpointId() const {
+            return endpoint->getEndpointId();
+        }
+
+        size_t allocateRange(size_t size) {
+            return endpoint->allocateRange(size);
+        }
+
+        void freeRange(size_t offset, size_t size) {
+            endpoint->freeRange(offset, size);
+        }
+#endif
+};
+
 class MemoryAllocationCFT : public MemoryAllocation {
 protected:
     CUmemAllocationProp memProp = {};
@@ -134,6 +271,7 @@ protected:
 
 #if CUDA_VERSION >= 13030
     CUlogicalEndpointId endpointId = {};
+    size_t endpointOffset = 0;
 #endif
 
 public:
@@ -146,7 +284,7 @@ public:
     }
 
     size_t getEndpointOffset() override {
-        return 0;
+        return endpointOffset;
     }
 #endif
 
@@ -156,6 +294,8 @@ public:
 };
 
 class MultinodeMemoryAllocationUnicastCFT : public MemoryAllocationCFT {
+private:
+    UnicastLogicalEndpointPool endpointPool;
 public:
     MultinodeMemoryAllocationUnicastCFT(size_t _allocationSize, int _MPIrank);
     ~MultinodeMemoryAllocationUnicastCFT();
@@ -316,6 +456,14 @@ public:
 
     void memset(int value, CopyType copyType = COPY_TYPE_CE, MemoryPurpose memoryPurpose = MemoryPurpose::MEMORY_SOURCE) {current->memset(value, copyType, memoryPurpose);}
     unsigned long long check(int value, CopyType copyType = COPY_TYPE_CE, int iterations = 0) {return current->check(value, copyType, iterations);}
+
+    std::vector<MemoryChunk> getChunks() override {
+        return current->getChunks();
+    }
+
+    int getNumLocalityDomains() const override {
+        return current->getNumLocalityDomains();
+    }
 #if CUDA_VERSION >= 13030
     CUlogicalEndpointId getEndpointId() override { return current->getEndpointId(); }
     size_t getEndpointOffset() override { return current->getEndpointOffset(); }
@@ -356,6 +504,7 @@ template class AllocationPool<HostMemoryAllocation>;
 template class AllocationPool<MultinodeMemoryAllocationUnicastCFT>;
 template class MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>;
 template class MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>;
+template class AllocationPool<LocalizedMultinodeMemoryAllocationUnicast>;
 
 void clearAllocationPools();
 

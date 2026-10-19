@@ -404,7 +404,7 @@ This makes GPU-to-rack testing effective at identifying problematic GPUs while b
 
 ### Fully-random
 
-Fully-random runs on all GPUs in the MPI domain. Each GPU performs a copy on a randomly selected peer, which can be any GPU but itself. A GPU can serve as the peer for multiple copies. 
+Fully-random runs on all GPUs in the MPI domain. Each GPU executes exactly one copy with a randomly selected peer, which can be any GPU but itself. For write testcases the executing GPU is the source of the copy, for read testcases it is the destination. A GPU can serve as the peer for multiple copies, but never executes more than one copy at a time.
 
 The results of this pattern will vary depending on the GPU pairings. Naturally, some pairings on the MPI domain will be slower than others. 
 
@@ -545,7 +545,20 @@ measurement_id, bandwidth/latency, gpu_src_id, gpu_dst_id, iteration_count, mem_
 3, latency, 3, 1, default, device, ignored, ignored, ignored, ignored, latency
 4, bandwidth, 3, 1, default, device, device, write, ce, 1G, latency_under_load
 4, latency, 1, 3, 40000, device, ignored, ignored, ignored, ignored, latency_under_load
+5, bandwidth, 0, 0, default, device, multicast, write, mc, default, multicast_one_to_all
 ```
+
+An example exercising the CFT and localized operation types, which require a newer CUDA toolkit:
+
+```csv
+measurement_id, bandwidth/latency, gpu_src_id, gpu_dst_id, iteration_count, mem_src_type, mem_dst_type, write/read, ce/sm/multicast, buffer_size, comment, result [GB/s] [ns]
+0, bandwidth, 0, 1, default, device, device, read, cft, 10000K, cft_read
+1, bandwidth, 0, 1, default, device, device, write, cft, 10000K, cft_write
+2, bandwidth, 0, 1, default, device, device, read, localized_ce, 1G, localized
+3, bandwidth, 0, 0, default, device, multicast, write, cft_mc, default, cft_multicast_one_to_all
+```
+
+Both examples are kept as runnable files in `tests/input.csv` and `tests/input-13-4.csv`.
 
 ### Measurement ID
 
@@ -583,15 +596,25 @@ How many iterations of bandwidth/latency benchmarks to execute. You can specify 
 
 ### Source memory type
 
-Type of memory for the source buffer. Can be either `device`, `egm` or `multicast`.
+Type of memory for the source buffer. Can be either `device`, `egm`, `multicast`, `cft`, `cft_multicast` or `localized`.
 
 Latency tests operate on the source memory buffer, however, only `device` and `egm` are accepted.
 
 ### Destination memory type
 
-Type of memory for the destination buffer. Can be either `device`, `egm` or `multicast`.
+Type of memory for the destination buffer. Can be either `device`, `egm`, `multicast`, `cft`, `cft_multicast` or `localized`.
 
 For latency tests, this parameter is ignored.
+
+### Memory types required by an operation type
+
+`cft`, `cft_multicast` and `localized` memory is only usable by the operation types that require it, and nvloom substitutes it automatically, so in practice you don't have to spell those types out:
+
+- for `cft` copies, `device` memory is replaced with `cft` memory
+- for `cft_mc` copies, `multicast` destination memory is replaced with `cft_multicast` memory
+- for `localized_ce` copies, `device` memory is replaced with `localized` memory
+
+Spelling those memory types out explicitly is allowed, but only makes sense when it matches the operation type.
 
 ### Copy direction: write/read
 
@@ -599,17 +622,23 @@ Whether the test is executed as a "read" (destination GPU executing the copy) or
 
 For latency tests, this parameter is ignored.
 
-### Operation type: ce/sm/multicast
+### Operation type: ce/sm/mc
 
 How the copy is executed.
 
-For `CE`, the copy is scheduled through `cuMemcpyAsync`.
+For `ce`, the copy is scheduled through `cuMemcpyAsync`.
 
-For `SM`, the copy is executed by a custom memcpy kernel.
+For `sm`, the copy is executed by a custom memcpy kernel.
 
-For `multicast` the copy is executed by a custom multicast memcpy kernel. In `multicast` case, the source memory has to be either `device` or `egm`, and the destination memory has to be `multicast`. Moreover, the copy type has to be `write`. Nvloom allocates multicast memory on every single process/GPU, so multicast copies will be writing to every single GPU visible to nvloom.
+For `mc` the copy is executed by a custom multicast memcpy kernel. In `mc` case, the source memory has to be either `device` or `egm`, and the destination memory has to be `multicast`. Moreover, the copy direction has to be `write`. Nvloom allocates multicast memory on every single process/GPU, so multicast copies will be writing to every single GPU visible to nvloom.
 
-Multicast reductions are not supported in the CSV testcase.
+For `localized_ce`, the copy is scheduled through `cuMemcpyAsync`, but both buffers are allocated as localized memory: the buffer is split between the locality domains of a GPU, and the copy is split into a per-locality-domain copy. This requires CUDA 13.4+, a 580+ driver, and a GPU exposing more than one locality domain.
+
+For `cft`, the copy is executed with the CUDA Compute Fabric Transport programming model. Direction selects the CFT flavor - `read` benchmarks a CFT read, `write` benchmarks a CFT write. Source and destination GPU have to be different. This requires CUDA 13.3+.
+
+For `cft_mc`, a CFT multicast write is benchmarked. As with `mc`, the destination memory has to be `multicast` and the direction has to be `write`. This requires CUDA 13.3+.
+
+Multicast reductions (`mc_ld_reduce`, `mc_red_single`, `mc_red_all`, `tma_mc_red_single`, `tma_mc_red_all`, `cft_mc_red_single`, `cft_mc_red_all`, `cft_mc_pullred`) are not supported in the CSV testcase.
 
 For latency tests, this parameter is ignored.
 
@@ -617,7 +646,7 @@ For latency tests, this parameter is ignored.
 
 Size of the buffer to copy, in bytes.
 
-You can also use `k`, `m`, `g` and `t` suffixes, meaning `1024`, `1024*1024`, `1024*1024*1024` and `1024*1024*1024*1024`. For example, `10k` will be evaluated to 10240 bytes.
+You can also use `k`, `m` and `g` suffixes, meaning `1024`, `1024*1024` and `1024*1024*1024`. For example, `10k` will be evaluated to 10240 bytes.
 
 For latency tests, this parameter is ignored.
 

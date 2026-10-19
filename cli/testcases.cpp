@@ -34,7 +34,6 @@
 #include <utility>
 #include <vector>
 
-#define PEER_COUNT_MAX 3
 
 std::mt19937 rng;
 
@@ -194,49 +193,26 @@ public:
         std::vector<std::string> rowLabels;
         std::vector<Copy> copies;
 
-        std::vector<int> gpus(MPIWrapper::getWorldSize());
-        std::iota(gpus.begin(), gpus.end(), 0);
+        // Each GPU executes exactly one copy with a uniformly random peer other than itself.
+        // A GPU can be the peer of multiple copies.
+        std::uniform_int_distribution<int> peerRange(0, MPIWrapper::getWorldSize() - 2);
 
-        std::vector<int> peers(MPIWrapper::getWorldSize());
-        std::iota(peers.begin(), peers.end(), 0);
+        for (int gpu = 0; gpu < MPIWrapper::getWorldSize(); gpu++) {
+            int peer = peerRange(rng);
+            if (peer >= gpu) peer++;
 
-        // Pre-shuffling the gpus and peers incorporates randomization
-        // without adding overhead to the matching phase. It also
-        // decreases the chances of repeated self-selection.
-        std::shuffle(gpus.begin(), gpus.end(), rng);
-        std::shuffle(peers.begin(), peers.end(), rng);
+            // gpu is always the executing device: the source for writes,
+            // the destination for reads.
+            int srcDevice = (copyDirection == COPY_DIRECTION_READ) ? peer : gpu;
+            int dstDevice = (copyDirection == COPY_DIRECTION_READ) ? gpu : peer;
 
-        std::vector<int> peerCounter(MPIWrapper::getWorldSize(), 0);
-        std::uniform_int_distribution<int> peerCountRange(1, PEER_COUNT_MAX);
+            std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, srcDevice);
+            std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, dstDevice);
+            copies.push_back(Copy(dst, src, copyDirection, copyType, iterations));
 
-        for (int gpu : gpus) {
-            if (peers.empty()) break;
-
-            int remainingPeerCount = peerCountRange(rng);
-            int popCount = 0;
-
-            // Peers are assigned from the tail of the list to allow for
-            // efficient removal when their threshold is met. By design,
-            // the ordering of peers is from least to most saturated.
-            for (auto peer = peers.crbegin(); peer != peers.crend(); ++peer) {
-                if (remainingPeerCount == 0 || peers.empty()) break;
-
-                std::shared_ptr<srcAllocator> src = std::make_shared<srcAllocator>(copySize, gpu);
-                std::shared_ptr<dstAllocator> dst = std::make_shared<dstAllocator>(copySize, *peer);
-                copies.push_back(Copy(dst, src, copyDirection, copyType, iterations));
-
-                std::stringstream s;
-                s << gpu << "->" << *peer;
-                rowLabels.push_back(s.str());
-
-                remainingPeerCount--;
-                peerCounter[*peer]++;
-                if (peerCounter[*peer] >= PEER_COUNT_MAX) popCount++;
-            }
-
-            // No need to check which peer to remove as the most saturated
-            // peers are at the tail of list.
-            for (int i = 0; i < popCount; i++) peers.pop_back();
+            std::stringstream s;
+            s << srcDevice << "->" << dstDevice;
+            rowLabels.push_back(s.str());
         }
 
         OutputMatrix output(getName(), 1, copies.size());
@@ -755,7 +731,7 @@ static void addTestcase(
     testcases[testcase->getName()] = std::move(testcase);
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator>
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename localizedAllocator, typename cftAllocator, typename cftMulticastAllocator>
 std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::string, std::vector<std::string> > > buildTestcasesLower() {
     std::map<std::string, std::unique_ptr<Testcase> > testcases;
     std::map<std::string, std::vector<std::string> > suites;
@@ -765,11 +741,15 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ,  COPY_TYPE_LOCALIZED_CE, COPY_COUNT_UNIDIR> >());
 
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
     addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
+    addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE> >());
+    addTestcase(suites, "pairwise", testcases, std::make_unique<N_squared_pattern_bidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ,  COPY_TYPE_LOCALIZED_CE> >());
 
     // pairwise TMA
     addTestcase(suites, "pairwise-tma", testcases, std::make_unique<N_squared_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA, COPY_COUNT_UNIDIR> >());
@@ -790,24 +770,32 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, NOT_RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA, NOT_RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA, NOT_RANDOM> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE, NOT_RANDOM> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ,  COPY_TYPE_LOCALIZED_CE, NOT_RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA, RANDOM> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE, RANDOM> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<bisect_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ,  COPY_TYPE_LOCALIZED_CE, RANDOM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<random_ring<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_SM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA> >());
     addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE> >());
+    addTestcase(suites, "fabric-stress", testcases, std::make_unique<fully_random_pattern<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE> >());
 
     // all-to-one
     addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_WRITE> >());
@@ -816,6 +804,10 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_READ> >());
     addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_TMA, COPY_DIRECTION_WRITE> >());
     addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, unicastAllocator, COPY_TYPE_TMA, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<localizedAllocator, localizedAllocator, COPY_TYPE_LOCALIZED_CE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<localizedAllocator, localizedAllocator, COPY_TYPE_LOCALIZED_CE, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<cftAllocator, unicastAllocator, COPY_TYPE_CFT_WRITE, COPY_DIRECTION_WRITE > >());
+    addTestcase(suites, "all-to-one", testcases, std::make_unique<all_to_one_pattern<unicastAllocator, cftAllocator, COPY_TYPE_CFT_READ, COPY_DIRECTION_READ > >());
 
     // all-to-one rack-aware
     addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_CE, COPY_DIRECTION_WRITE> >());
@@ -824,6 +816,10 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_SM, COPY_DIRECTION_READ> >());
     addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_TMA, COPY_DIRECTION_WRITE> >());
     addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, unicastAllocator, COPY_TYPE_TMA, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<localizedAllocator, localizedAllocator, COPY_TYPE_LOCALIZED_CE, COPY_DIRECTION_WRITE> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<localizedAllocator, localizedAllocator, COPY_TYPE_LOCALIZED_CE, COPY_DIRECTION_READ> >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<cftAllocator, unicastAllocator, COPY_TYPE_CFT_WRITE, COPY_DIRECTION_WRITE > >());
+    addTestcase(suites, "rack-aware-all-to-one", testcases, std::make_unique<all_to_one_rack_aware<unicastAllocator, cftAllocator, COPY_TYPE_CFT_READ, COPY_DIRECTION_READ > >());
 
     // multicast
     addTestcase(suites, "multicast", testcases, std::make_unique<multicast_one_to_all<multicastAllocator, DeviceMemoryAllocation, COPY_TYPE_MULTICAST_WRITE, COPY_DIRECTION_WRITE> >());
@@ -875,6 +871,9 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA, COPY_COUNT_UNIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<cftAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CFT_WRITE, COPY_COUNT_UNIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, cftAllocator, COPY_DIRECTION_READ, COPY_TYPE_CFT_READ, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE, COPY_COUNT_UNIDIR> >());
+    addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE, COPY_COUNT_UNIDIR> >());
+
 
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_BIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE, COPY_COUNT_BIDIR> >());
@@ -884,6 +883,8 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA, COPY_COUNT_BIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<cftAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CFT_WRITE, COPY_COUNT_BIDIR> >());
     addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, cftAllocator, COPY_DIRECTION_READ, COPY_TYPE_CFT_READ, COPY_COUNT_BIDIR> >());
+    addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE, COPY_COUNT_BIDIR> >());
+    addTestcase(suites, "gpu-to-rack", testcases, std::make_unique<gpu_to_rack<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE, COPY_COUNT_BIDIR> >());
 
     // egm-gpu-to-rack
     addTestcase(suites, "egm-gpu-to-rack", testcases, std::make_unique<gpu_to_rack<unicastAllocator, egmAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE, COPY_COUNT_UNIDIR> >());
@@ -903,6 +904,8 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_unidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE> >());
 
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_CE> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_CE> >());
@@ -910,9 +913,11 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_SM> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_TMA> >());
     addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<unicastAllocator, unicastAllocator, COPY_DIRECTION_READ, COPY_TYPE_TMA> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_WRITE, COPY_TYPE_LOCALIZED_CE> >());
+    addTestcase(suites, "rack-to-rack", testcases, std::make_unique<rack_to_rack_bidir<localizedAllocator, localizedAllocator, COPY_DIRECTION_READ, COPY_TYPE_LOCALIZED_CE> >());
 
     // csv
-    addTestcase(suites, "csv", testcases, std::make_unique<csv_pattern<unicastAllocator, egmAllocator, multicastAllocator> >());
+    addTestcase(suites, "csv", testcases, std::make_unique<csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator> >());
 
     // latency
     addTestcase(suites, "latency", testcases, std::make_unique<latency<unicastAllocator> >());
@@ -926,20 +931,34 @@ std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::stri
         return buildTestcasesLower< MultinodeMemoryAllocationUnicast,
                                     MultinodeMemoryAllocationEGM,
                                     MultinodeMemoryAllocationMulticast,
+                                    LocalizedMultinodeMemoryAllocationUnicast,
                                     MultinodeMemoryAllocationUnicastCFT,
                                     MultinodeMemoryAllocationMulticastCFT>();
     } else if (strategy == ALLOCATOR_STRATEGY_REUSE) {
+        // like the allocations themselves, the endpoints are reused until the pools are cleared
+        UnicastLogicalEndpointPool::setRetainEndpoints(true);
+
         return buildTestcasesLower< AllocationPool<MultinodeMemoryAllocationUnicast>,
                                     AllocationPool<MultinodeMemoryAllocationEGM>,
                                     MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>,
+                                    AllocationPool<LocalizedMultinodeMemoryAllocationUnicast>,
                                     AllocationPool<MultinodeMemoryAllocationUnicastCFT>,
                                     MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>>();
     } else if (strategy == ALLOCATOR_STRATEGY_CUDA_POOLS) {
         return buildTestcasesLower< MultinodeMemoryPoolAllocationUnicast,
                                     MultinodeMemoryPoolAllocationEGM,
                                     MultinodeMemoryAllocationMulticastCudaPool,
+                                    LocalizedMultinodeMemoryAllocationUnicast,
                                     MultinodeMemoryAllocationUnicastCFT,
                                     MultinodeMemoryAllocationMulticastCFT>();
     }
     ASSERT(0);
+}
+
+std::vector<std::string> getSuiteNames() {
+    // The set of suites is identical for every allocator strategy (the suite
+    // names are hardcoded in buildTestcasesLower and don't depend on the
+    // allocator template parameters), so any strategy enumerates them all.
+    auto [testcases, suites] = buildTestcases(ALLOCATOR_STRATEGY_UNIQUE);
+    return getKeys(suites);
 }

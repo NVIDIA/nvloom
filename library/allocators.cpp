@@ -21,6 +21,10 @@
 #include "nvloom.h"
 #include "enums.h"
 
+static size_t roundUp(size_t number, size_t multiple) {
+    return ((number + multiple - 1) / multiple) * multiple;
+}
+
 unsigned long long MemoryAllocation::check(int value, CopyType copyType, int iterations) {
     if (MPIrank == MPIWrapper::getWorldRank()) {
         return checkBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, iterations);
@@ -32,6 +36,121 @@ void MemoryAllocation::memset(int value, CopyType copyType, MemoryPurpose memory
     if (MPIrank == MPIWrapper::getWorldRank()) {
         memsetBuffer(ptr, value, allocationSize, CU_STREAM_PER_THREAD, copyType, memoryPurpose);
     }
+}
+
+LocalizedMultinodeMemoryAllocationUnicast::LocalizedMultinodeMemoryAllocationUnicast(size_t _allocationSize, int _MPIrank) {
+#if CUDA_VERSION >= 13040
+    MPIrank = _MPIrank;
+    handleType = CU_MEM_HANDLE_TYPE_FABRIC;
+    CU_ASSERT(cuDeviceGetAttribute(&numLocalityDomains, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, NvLoom::getLocalCuDevice()));
+    ASSERT(numLocalityDomains >= 1);
+
+    handles.resize(numLocalityDomains);
+    fhs.resize(numLocalityDomains);
+    memoryChunks.resize(numLocalityDomains);
+
+    auto makeProp = [&](int domain) {
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN;
+        prop.location.localized.deviceId = (unsigned char)NvLoom::getLocalDevice();
+        prop.location.localized.localityDomainId = (unsigned char)domain;
+        return prop;
+    };
+
+    size_t granularity = 0;
+    CUmemAllocationProp prop = makeProp(0);
+    CU_ASSERT(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+
+    roundedChunkSize = roundUp((_allocationSize + numLocalityDomains - 1) / numLocalityDomains, granularity);
+    allocationSize = roundedChunkSize * numLocalityDomains;
+
+    if (_MPIrank == MPIWrapper::getWorldRank()) {
+        for (int i = 0; i < numLocalityDomains; i++) {
+            CUmemAllocationProp p = makeProp(i);
+            CU_ASSERT(cuMemCreate(&handles[i], roundedChunkSize, &p, 0));
+            CU_ASSERT(cuMemExportToShareableHandle(&fhs[i], handles[i], handleType, 0));
+        }
+    }
+
+    MPI_Bcast(fhs.data(), fhs.size() * sizeof(CUmemFabricHandle), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
+
+    if (_MPIrank != MPIWrapper::getWorldRank()) {
+        for (int i = 0; i < numLocalityDomains; i++) {
+            CU_ASSERT(cuMemImportFromShareableHandle(&handles[i], (void *)&fhs[i], handleType));
+        }
+    }
+
+    CU_ASSERT(cuMemAddressReserve((CUdeviceptr *)&ptr, allocationSize, 0, 0, 0));
+
+    for (int i = 0; i < numLocalityDomains; i++) {
+        CUdeviceptr chunk = (CUdeviceptr)ptr + (size_t)i * roundedChunkSize;
+        CU_ASSERT(cuMemMap(chunk, roundedChunkSize, 0, handles[i], 0));
+
+        CUmemAccessDesc desc = {};
+        desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        desc.location.id = NvLoom::getLocalDevice();
+        desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        CU_ASSERT(cuMemSetAccess(chunk, roundedChunkSize, &desc, 1));
+
+        memoryChunks[i] = { (void *)chunk, roundedChunkSize, i};
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+LocalizedMultinodeMemoryAllocationUnicast::~LocalizedMultinodeMemoryAllocationUnicast() {
+#if CUDA_VERSION >= 13040
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (int i = 0; i < numLocalityDomains; i++) {
+        CUdeviceptr chunk = (CUdeviceptr)ptr + (size_t)i * roundedChunkSize;
+        CU_ASSERT(cuMemUnmap(chunk, roundedChunkSize));
+        CU_ASSERT(cuMemRelease(handles[i]));
+    }
+    CU_ASSERT(cuMemAddressFree((CUdeviceptr)ptr, allocationSize));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+#else
+    ASSERT(0);
+#endif
+}
+
+// A copy through an allocation is only legal when every process belongs to the same fabric
+// clique of the type backing that allocation. Clique information is unavailable below CUDA 13.4,
+// where nothing is waived on these grounds.
+#if CUDA_VERSION >= 13040
+static bool unicastPointerCliqueShared() { return !NvLoom::isCliqueSplit(CU_CLIQUE_TYPE_UNICAST_POINTER); }
+static bool multicastPointerCliqueShared() { return !NvLoom::isCliqueSplit(CU_CLIQUE_TYPE_MULTICAST_POINTER); }
+static bool unicastEndpointCliqueShared() { return !NvLoom::isCliqueSplit(CU_CLIQUE_TYPE_UNICAST_LOGICAL_ENDPOINT); }
+static bool multicastEndpointCliqueShared() { return !NvLoom::isCliqueSplit(CU_CLIQUE_TYPE_MULTICAST_LOGICAL_ENDPOINT); }
+#else
+static bool unicastPointerCliqueShared() { return true; }
+static bool multicastPointerCliqueShared() { return true; }
+static bool unicastEndpointCliqueShared() { return true; }
+static bool multicastEndpointCliqueShared() { return true; }
+#endif
+
+bool LocalizedMultinodeMemoryAllocationUnicast::filter() {
+#if CUDA_VERSION >= 13040
+    int driverVersion = 0;
+    CU_ASSERT(cuDriverGetVersion(&driverVersion));
+    if (driverVersion < 13040) return false;
+
+    int fabricSupported = 0;
+    int numLocalityDomains = 0;
+
+    CU_ASSERT(cuDeviceGetAttribute(&fabricSupported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, NvLoom::getLocalCuDevice()));
+    CU_ASSERT(cuDeviceGetAttribute(&numLocalityDomains, CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT, NvLoom::getLocalCuDevice()));
+
+    return (fabricSupported != 0) && (numLocalityDomains > 1) && unicastPointerCliqueShared();
+#else
+    return false;
+#endif
 }
 
 #if CUDA_VERSION >= 13030
@@ -74,10 +193,6 @@ HostMemoryAllocation::~HostMemoryAllocation() {
     if (MPIrank == MPIWrapper::getWorldRank()) {
         CU_ASSERT(cuMemFreeHost(ptr));
     }
-}
-
-static size_t roundUp(size_t number, size_t multiple) {
-    return ((number + multiple - 1) / multiple) * multiple;
 }
 
 MultinodeMemoryAllocationBase::MultinodeMemoryAllocationBase(size_t _allocationSize, int _MPIrank, CUmemLocationType location) {
@@ -150,13 +265,13 @@ MultinodeMemoryAllocationBase::~MultinodeMemoryAllocationBase() {
 bool MultinodeMemoryAllocationUnicast::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return pi != 0;
+    return pi != 0 && unicastPointerCliqueShared();
 };
 
 bool MultinodeMemoryAllocationEGM::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HOST_NUMA_MULTINODE_IPC_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return pi != 0;
+    return pi != 0 && unicastPointerCliqueShared();
 };
 
 size_t MemoryAllocationCFT::getRoundedAllocationSize(size_t _allocationSize) {
@@ -197,20 +312,87 @@ void MemoryAllocationCFT::freeMemory(void *ptr) {
     CU_ASSERT(cuMemAddressFree((CUdeviceptr) ptr, roundedUpAllocationSize));
 }
 
-MultinodeMemoryAllocationUnicastCFT::MultinodeMemoryAllocationUnicastCFT(size_t _allocationSize, int _MPIrank) {
+RangeAllocator::RangeAllocator(size_t _regionSize, size_t _alignment) {
+    regionSize = _regionSize;
+    alignment = _alignment;
+    freeRanges[0] = regionSize;
+}
+
+size_t RangeAllocator::allocate(size_t size) {
+    size = roundUp(size, alignment);
+
+    // first fit
+    for (auto it = freeRanges.begin(); it != freeRanges.end(); it++) {
+        if (it->second < size) {
+            continue;
+        }
+
+        size_t offset = it->first;
+        size_t remaining = it->second - size;
+        freeRanges.erase(it);
+        if (remaining != 0) {
+            freeRanges[offset + size] = remaining;
+        }
+        return offset;
+    }
+
+    // no free range is large enough
+    ASSERT(0);
+    return 0;
+}
+
+void RangeAllocator::free(size_t offset, size_t size) {
+    size = roundUp(size, alignment);
+
+    // merge with the free range starting right after the released one
+    auto next = freeRanges.upper_bound(offset);
+    if (next != freeRanges.end()) {
+        ASSERT(offset + size <= next->first);
+        if (offset + size == next->first) {
+            size += next->second;
+            next = freeRanges.erase(next);
+        }
+    }
+
+    // merge with the free range ending right before the released one
+    if (next != freeRanges.begin()) {
+        auto previous = next;
+        previous--;
+        ASSERT(previous->first + previous->second <= offset);
+        if (previous->first + previous->second == offset) {
+            previous->second += size;
+            return;
+        }
+    }
+
+    freeRanges[offset] = size;
+}
+
+bool RangeAllocator::isFullyFree() {
+    return freeRanges.size() == 1 && freeRanges.begin()->second == regionSize;
+}
+
+UnicastLogicalEndpoint::UnicastLogicalEndpoint(int _MPIrank) {
 #if CUDA_VERSION >= 13030
+    MPIrank = _MPIrank;
+
+    CUlogicalEndpointFabricHandle fh = {};
+
     CU_ASSERT(cuLogicalEndpointIdReserve(&endpointId, 1 /*count*/));
     CUlogicalEndpointProp endpointProp = {};
     endpointProp.unicast.device = NvLoom::getLocalDevice();
     endpointProp.flags = 0;
     endpointProp.ipcHandleTypes = CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC;
     endpointProp.type = CU_LOGICAL_ENDPOINT_TYPE_UNICAST;
-    // cuLogicalEndpointBindMem binds the granularity-rounded size, which must fit within the endpoint
-    endpointProp.size = getRoundedAllocationSize(_allocationSize);
+    cuuint64_t bindAlignment = 0;
+    cuuint64_t maxSize = 0;
 
-    CUlogicalEndpointFabricHandle fh = {};
+    CU_ASSERT(cuLogicalEndpointGetLimits(&bindAlignment, &maxSize, &endpointProp));
+    endpointProp.size = maxSize;
 
-    if (_MPIrank == MPIWrapper::getWorldRank()) {
+    rangeAllocator.emplace(maxSize, bindAlignment);
+
+    if (MPIrank == MPIWrapper::getWorldRank()) {
         CU_ASSERT(cuLogicalEndpointCreate(endpointId, &endpointProp));
 
         int queryStatus = 0;
@@ -218,20 +400,12 @@ MultinodeMemoryAllocationUnicastCFT::MultinodeMemoryAllocationUnicastCFT(size_t 
             CU_ASSERT(cuLogicalEndpointQuery(endpointId, 1, &queryStatus));
         }
 
-        ptr = allocateMemory(_allocationSize);
-
-        // Bind memory
-        CU_ASSERT(cuLogicalEndpointBindMem(endpointId, NvLoom::getLocalDevice(), 0, handle, 0, roundedUpAllocationSize, 0 /*flags*/));
-
         CU_ASSERT(cuLogicalEndpointExport(&fh, endpointId, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
     }
 
-    MPI_Bcast(&fh, sizeof(fh), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
+    MPI_Bcast(&fh, sizeof(fh), MPI_BYTE, MPIrank, MPI_COMM_WORLD);
 
-    if (_MPIrank != MPIWrapper::getWorldRank()) {
-        // Only local process can access the memory through pointers
-        ptr = nullptr;
-
+    if (MPIrank != MPIWrapper::getWorldRank()) {
         CU_ASSERT(cuLogicalEndpointImport(endpointId, (void *)&fh, CU_LOGICAL_ENDPOINT_IPC_HANDLE_TYPE_FABRIC));
 
         int queryStatus = 0;
@@ -239,12 +413,76 @@ MultinodeMemoryAllocationUnicastCFT::MultinodeMemoryAllocationUnicastCFT(size_t 
             CU_ASSERT(cuLogicalEndpointQuery(endpointId, 1, &queryStatus));
         }
     }
+#else
+    ASSERT(0);
+#endif
+}
+
+UnicastLogicalEndpoint::~UnicastLogicalEndpoint() {
+#if CUDA_VERSION >= 13030
+    // every allocation sharing this endpoint must have released its range by now
+    ASSERT(rangeAllocator->isFullyFree());
+
+    CU_ASSERT(cuLogicalEndpointDestroy(endpointId));
+    CU_ASSERT(cuLogicalEndpointIdRelease(endpointId, 1 /*count*/));
+#else
+    ASSERT(0);
+#endif
+}
+
+#if CUDA_VERSION >= 13030
+size_t UnicastLogicalEndpoint::allocateRange(size_t size) {
+    return rangeAllocator->allocate(size);
+}
+
+void UnicastLogicalEndpoint::freeRange(size_t offset, size_t size) {
+    rangeAllocator->free(offset, size);
+}
+#endif
+
+UnicastLogicalEndpointPool::UnicastLogicalEndpointPool(int MPIrank) {
+    auto it = pool.find(MPIrank);
+    if (it != pool.end()) {
+        // the entry is stale if the endpoint got destroyed since it was inserted
+        endpoint = it->second.lock();
+    }
+
+    if (endpoint == nullptr) {
+        endpoint = std::make_shared<UnicastLogicalEndpoint>(MPIrank);
+        pool[MPIrank] = endpoint;
+    }
+
+    if (retainEndpoints) {
+        retainedEndpoints[MPIrank] = endpoint;
+    }
+}
+
+void UnicastLogicalEndpointPool::setRetainEndpoints(bool _retainEndpoints) {
+    retainEndpoints = _retainEndpoints;
+}
+
+void UnicastLogicalEndpointPool::clear() {
+    // endpoints which are still used by an allocation outlive this call
+    retainedEndpoints.clear();
+}
+
+MultinodeMemoryAllocationUnicastCFT::MultinodeMemoryAllocationUnicastCFT(size_t _allocationSize, int _MPIrank) : endpointPool(_MPIrank) {
+#if CUDA_VERSION >= 13030
+    endpointId = endpointPool.getEndpointId();
+
+    if (_MPIrank == MPIWrapper::getWorldRank()) {
+        ptr = allocateMemory(_allocationSize);
+        endpointOffset = endpointPool.allocateRange(roundedUpAllocationSize);
+        CU_ASSERT(cuLogicalEndpointBindMem(endpointId, NvLoom::getLocalDevice(), endpointOffset, handle, 0, roundedUpAllocationSize, 0 /*flags*/));
+    } else {
+        // Only local process can access the memory through pointers
+        ptr = nullptr;
+    }
 
     MPIrank = _MPIrank;
     allocationSize = _allocationSize;
 
-    // Make sure that everyone is done with mapping the fabric allocation
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Bcast(&endpointOffset, sizeof(endpointOffset), MPI_BYTE, _MPIrank, MPI_COMM_WORLD);
 #else
     ASSERT(0);
 #endif
@@ -256,13 +494,11 @@ MultinodeMemoryAllocationUnicastCFT::~MultinodeMemoryAllocationUnicastCFT() {
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (MPIrank == MPIWrapper::getWorldRank()) {
+        CU_ASSERT(cuLogicalEndpointUnbind(endpointId, NvLoom::getLocalDevice(), endpointOffset, roundedUpAllocationSize));
+        endpointPool.freeRange(endpointOffset, roundedUpAllocationSize);
         freeMemory(ptr);
     }
 
-    CU_ASSERT(cuLogicalEndpointDestroy(endpointId));
-    CU_ASSERT(cuLogicalEndpointIdRelease(endpointId, 1 /*count*/));
-
-    MPI_Barrier(MPI_COMM_WORLD);
 #else
     ASSERT(0);
 #endif
@@ -279,7 +515,7 @@ bool MultinodeMemoryAllocationUnicastCFT::filter() {
 
     int unicastSupported;
     CU_ASSERT(cuDeviceGetAttribute(&unicastSupported, CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_UNICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return unicastSupported != 0;
+    return unicastSupported != 0 && unicastEndpointCliqueShared();
 #else
     return false;
 #endif
@@ -335,6 +571,8 @@ MultinodeMemoryAllocationMulticastCFT::~MultinodeMemoryAllocationMulticastCFT() 
     // Make sure that everyone is done using the memory
     MPI_Barrier(MPI_COMM_WORLD);
 
+    CU_ASSERT(cuLogicalEndpointUnbind(endpointId, NvLoom::getLocalDevice(), 0, roundedUpAllocationSize));
+
     freeMemory(unicastMappingPtr);
 
     CU_ASSERT(cuLogicalEndpointDestroy(endpointId));
@@ -361,7 +599,7 @@ bool MultinodeMemoryAllocationMulticastCFT::filter() {
 
     int multicastSupported;
     CU_ASSERT(cuDeviceGetAttribute(&multicastSupported, CU_DEVICE_ATTRIBUTE_LOGICAL_ENDPOINT_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return multicastSupported != 0;
+    return multicastSupported != 0 && multicastEndpointCliqueShared();
 #else
     return false;
 #endif
@@ -512,7 +750,7 @@ unsigned long long MultinodeMemoryAllocationMulticastRef::check(int value, CopyT
 bool MultinodeMemoryAllocationMulticastRef::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return pi != 0;
+    return pi != 0 && multicastPointerCliqueShared();
 };
 
 std::unique_ptr<MultinodeMemoryAllocationMulticastRef> MultinodeMemoryAllocationMulticast::createRef(int chunkIndex, size_t chunkSize, int _MPIrank) {
@@ -611,13 +849,13 @@ MultinodeMemoryPoolAllocationBase::~MultinodeMemoryPoolAllocationBase() {
 bool MultinodeMemoryPoolAllocationUnicast::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return pi != 0;
+    return pi != 0 && unicastPointerCliqueShared();
 };
 
 bool MultinodeMemoryPoolAllocationEGM::filter() {
     int pi;
     CU_ASSERT(cuDeviceGetAttribute(&pi, CU_DEVICE_ATTRIBUTE_HOST_NUMA_MULTINODE_IPC_SUPPORTED, NvLoom::getLocalCuDevice()));
-    return pi != 0;
+    return pi != 0 && unicastPointerCliqueShared();
 };
 
 template<class T>
@@ -715,7 +953,10 @@ void clearAllocationPools() {
     AllocationPool<MultinodeMemoryAllocationUnicast>::clear();
     AllocationPool<MultinodeMemoryAllocationEGM>::clear();
     AllocationPool<HostMemoryAllocation>::clear();
+    AllocationPool<LocalizedMultinodeMemoryAllocationUnicast>::clear();
     AllocationPool<MultinodeMemoryAllocationUnicastCFT>::clear();
     MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>::clear();
     MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>::clear();
+    // has to come last: the allocations cleared above hold references to the endpoints
+    UnicastLogicalEndpointPool::clear();
 }

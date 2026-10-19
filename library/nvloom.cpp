@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <numeric>
 #include <iomanip>
 #include <string.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@
 #include "kernels.cuh"
 #include "nvloom.h"
 #include <cuda.h>
+#include <cudaTypedefs.h>
 #define NVML_NO_UNVERSIONED_FUNC_DEFS
 #include <nvml.h>
 
@@ -86,6 +88,29 @@ Benchmark::Benchmark(std::vector<Copy> _copies) : copies(_copies) {
     filteredExecutedIterations.resize(filteredCopies.size());
 
     NvLoom::setCurrentCopies(filteredCopies);
+
+    int ceCopies = 0;
+    int nonCeCopies = 0;
+    for (auto &copy : filteredCopies) {
+        if (copy.copyType == COPY_TYPE_CE) {
+            ceCopies++;
+        } else if (copy.copyType == COPY_TYPE_LOCALIZED_CE) {
+#if CUDA_VERSION >= 13040
+            // Localized CE copies are split into one copy per locality domain, count each only once
+            if (std::static_pointer_cast<MemoryChunkAllocation>(copy.src)->localityDomainId == 0) {
+                ceCopies++;
+            }
+#endif
+        } else {
+            nonCeCopies++;
+        }
+    }
+    if (ceCopies > 1) {
+        std::cerr << "WARNING: Process " << MPIWrapper::getWorldRank() << " is executing " << ceCopies << " CE copies at the same time" << std::endl;
+    }
+    if (nonCeCopies > 1) {
+        std::cerr << "WARNING: Process " << MPIWrapper::getWorldRank() << " is executing " << nonCeCopies << " non-CE copies at the same time" << std::endl;
+    }
 
     blockingVarHost = std::make_shared<AllocationPool<HostMemoryAllocation>>(sizeof(int), copies[0].executingMPIrank);
     blockingVarDevice = std::make_shared<AllocationPool<MultinodeMemoryAllocationUnicast>>(sizeof(int), copies[0].executingMPIrank);
@@ -150,7 +175,7 @@ void Benchmark::fillBuffers() {
 }
 
 void Benchmark::doMemcpyWarmup(Copy& copy, CUstream hStream) {
-    if (copy.copyType == COPY_TYPE_CE) {
+    if (copy.copyType == COPY_TYPE_CE || copy.copyType == COPY_TYPE_LOCALIZED_CE) {
         for (int iter = 0; iter < WARMUP_ITERATIONS; iter++) {
             CU_ASSERT(cuMemcpyAsync((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream));
         }
@@ -188,7 +213,7 @@ void Benchmark::doMemcpyWarmup(Copy& copy, CUstream hStream) {
 }
 
 unsigned long long Benchmark::doMemcpyInSpinKernel(Copy& copy, CUstream hStream, unsigned long long loopCount) {
-    if (copy.copyType == COPY_TYPE_CE) {
+    if (copy.copyType == COPY_TYPE_CE || copy.copyType == COPY_TYPE_LOCALIZED_CE) {
         // We're only launching 128 iterations in the spinkernel guarded loop to avoid possibility of a deadlock
         loopCount = std::min(loopCount, (unsigned long long) 128);
         for (int iter = 0; iter < loopCount; iter++) {
@@ -236,7 +261,7 @@ unsigned long long Benchmark::doMemcpyInSpinKernel(Copy& copy, CUstream hStream,
 }
 
 void Benchmark::doMemcpyBeyondSpinKernel(Copy& copy, CUstream hStream) {
-    if (copy.copyType == COPY_TYPE_CE) {
+    if (copy.copyType == COPY_TYPE_CE || copy.copyType == COPY_TYPE_LOCALIZED_CE) {
         CU_ASSERT(cuMemcpyAsync((CUdeviceptr) copy.dst->ptr, (CUdeviceptr) copy.src->ptr, copy.src->allocationSize, hStream));
     }
 }
@@ -320,6 +345,7 @@ void Benchmark::scheduleWorkPostBlock() {
         for (int i = 0; i < filteredCopies.size(); i++) {
             Copy &copy = filteredCopies[i];
             if (filteredExecutedIterations[i] < copy.iterations) {
+                bool isLastIter = (filteredExecutedIterations[i] + 1 == copy.iterations);
                 doMemcpyBeyondSpinKernel(copy, filteredStreams[i]);
                 filteredExecutedIterations[i]++;
                 pendingWork = true;
@@ -439,9 +465,7 @@ void Benchmark::doLoadSustainment() {
     }
 }
 
-std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
-    if (copies.size() == 0) {return {};};
-
+std::vector<double> NvLoom::doBenchmarkCore(std::vector<Copy> copies) {
     Benchmark benchmarkState(copies);
 
     benchmarkState.fillBuffers();
@@ -477,6 +501,55 @@ std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
     benchmarkState.verifyBuffers();
 
     return benchmarkState.calculateBandwidths();
+}
+
+std::vector<double> NvLoom::doBenchmark(std::vector<Copy> copies) {
+    if (copies.size() == 0) return {};
+
+#if CUDA_VERSION >= 13040
+    std::vector<Copy> allCopies;
+    std::vector<int> localityDomainsPerCopy(copies.size(), 1);
+    std::map<void*, std::shared_ptr<MemoryChunkAllocation>> srcChunkCache;
+
+    for (int i = 0; i < copies.size(); i++) {
+        if (copies[i].copyType == COPY_TYPE_LOCALIZED_CE) {
+            int numLocalityDomains = copies[i].src->getNumLocalityDomains();
+            ASSERT(numLocalityDomains > 1);
+            localityDomainsPerCopy[i] = numLocalityDomains;
+
+            auto srcChunks = copies[i].src->getChunks();
+            auto dstChunks = copies[i].dst->getChunks();
+
+            for (int d = 0; d < numLocalityDomains; d++) {
+                void *srcPtr = srcChunks[d].ptr;
+
+                // The cache ensures the same physical src chunk always maps to the
+                // same MemoryChunkAllocation. This prevents memory access issues.
+                if (srcChunkCache.find(srcPtr) == srcChunkCache.end()) {
+                    srcChunkCache[srcPtr] = std::make_shared<MemoryChunkAllocation>(srcChunks[d], copies[i].src->MPIrank, copies[i].src);
+                }
+                auto dstChunk = std::make_shared<MemoryChunkAllocation>(dstChunks[d], copies[i].dst->MPIrank, copies[i].dst);
+                allCopies.push_back(Copy(dstChunk, srcChunkCache[srcPtr], copies[i].copyDirection, COPY_TYPE_LOCALIZED_CE, copies[i].iterations));
+            }
+        }
+        else {
+            allCopies.push_back(copies[i]);
+        }
+    }
+
+    std::vector<double> allCopiesResults = doBenchmarkCore(allCopies);
+
+    std::vector<double> results(copies.size());
+
+    int allCopiesIdx = 0;
+    for (int i = 0; i < copies.size(); i++) {
+        for (int d = 0; d < localityDomainsPerCopy[i]; d++) {
+            results[i] += allCopiesResults[allCopiesIdx++];
+        }
+    }
+    return results;
+#endif
+    return doBenchmarkCore(copies);
 }
 
 bool NvLoom::executingCopies() {
@@ -537,20 +610,130 @@ static nvmlDevice_t getNvmlDevice(int device) {
     return nvmlDev;
 }
 
-static int checkCliques() {
-    nvmlDevice_t nvmlDev = getNvmlDevice(NvLoom::getLocalDevice());
-
+static nvmlGpuFabricInfoV_t getGpuFabricInfo(int device) {
     nvmlGpuFabricInfoV_t fabricInfo { .version = nvmlGpuFabricInfo_v2 };
     fabricInfo.state = NVML_GPU_FABRIC_STATE_NOT_SUPPORTED;
-    NVML_ASSERT(nvmlDeviceGetGpuFabricInfoV(nvmlDev, &fabricInfo));
+    NVML_ASSERT(nvmlDeviceGetGpuFabricInfoV(getNvmlDevice(device), &fabricInfo));
+    return fabricInfo;
+}
+
+#if CUDA_VERSION >= 13040
+// The clique API was introduced in CUDA 13.4, so it's queried through cuGetProcAddress
+// to keep nvloom working on older drivers.
+static bool loadCliqueApi(PFN_cuDeviceGetCliqueCount_v13040 &pfnGetCliqueCount, PFN_cuDeviceGetCliqueInfo_v13040 &pfnGetCliqueInfo) {
+    CUdriverProcAddressQueryResult symbolStatus;
+
+    if (CUDA_SUCCESS != cuGetProcAddress("cuDeviceGetCliqueCount", (void **) &pfnGetCliqueCount, 13040, CU_GET_PROC_ADDRESS_DEFAULT, &symbolStatus) ||
+        symbolStatus != CU_GET_PROC_ADDRESS_SUCCESS) {
+        return false;
+    }
+
+    if (CUDA_SUCCESS != cuGetProcAddress("cuDeviceGetCliqueInfo", (void **) &pfnGetCliqueInfo, 13040, CU_GET_PROC_ADDRESS_DEFAULT, &symbolStatus) ||
+        symbolStatus != CU_GET_PROC_ADDRESS_SUCCESS) {
+        return false;
+    }
+
+    return true;
+}
+
+// Queries the fabric cliques the local device is part of, and stores their IDs indexed by clique type
+static void queryCliqueIds() {
+    auto &cliqueIds = NvLoom::getLocalCliqueIds();
+    cliqueIds.clear();
+
+    PFN_cuDeviceGetCliqueCount_v13040 pfnGetCliqueCount = nullptr;
+    PFN_cuDeviceGetCliqueInfo_v13040 pfnGetCliqueInfo = nullptr;
+
+    if (!loadCliqueApi(pfnGetCliqueCount, pfnGetCliqueInfo)) {
+        // Pre-13.4 drivers only expose a single clique ID through NVML, which describes
+        // pointer sharing. Logical endpoint cliques are not reported by NVML.
+        auto fabricInfo = getGpuFabricInfo(NvLoom::getLocalDevice());
+        if (fabricInfo.state != NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {
+            cliqueIds[CU_CLIQUE_TYPE_UNICAST_POINTER] = fabricInfo.cliqueId;
+            cliqueIds[CU_CLIQUE_TYPE_MULTICAST_POINTER] = fabricInfo.cliqueId;
+        }
+        return;
+    }
+
+    size_t count = 0;
+    CU_ASSERT(pfnGetCliqueCount(&count, NvLoom::getLocalCuDevice()));
+    if (count == 0) {
+        return;
+    }
+
+    std::vector<CUcliqueInfo> cliqueInfo(count);
+    CU_ASSERT(pfnGetCliqueInfo(&cliqueInfo[0], &count, NvLoom::getLocalCuDevice()));
+    ASSERT(count <= cliqueInfo.size());
+
+    for (size_t i = 0; i < count; i++) {
+        // A device is expected to be part of at most one clique of each type
+        ASSERT(cliqueIds.count(cliqueInfo[i].type) == 0);
+        cliqueIds[cliqueInfo[i].type] = cliqueInfo[i].id;
+    }
+}
+
+// Exchanges the local fabric clique IDs across the MPI world, and records for each clique type
+// whether all processes are part of the same clique. Allocators whose clique type isn't shared by
+// every process are waived in their filter(), which waives every testcase built on them.
+static void exchangeCliqueIds() {
+    auto &cliqueSharingMap = NvLoom::getCliqueSharingMap();
+    cliqueSharingMap.clear();
+
+    // Each clique type contributes a presence flag followed by the clique ID
+    constexpr int entriesPerType = 2;
+    constexpr int numTypes = sizeof(ALL_CLIQUE_TYPES) / sizeof(ALL_CLIQUE_TYPES[0]);
+    const int worldSize = MPIWrapper::getWorldSize();
+
+    std::vector<unsigned int> localEntries(numTypes * entriesPerType, 0);
+    for (int i = 0; i < numTypes; i++) {
+        unsigned int cliqueId;
+        if (NvLoom::getLocalCliqueId(ALL_CLIQUE_TYPES[i], cliqueId)) {
+            localEntries[i * entriesPerType] = 1;
+            localEntries[i * entriesPerType + 1] = cliqueId;
+        }
+    }
+
+    std::vector<unsigned int> exchangedEntries(worldSize * numTypes * entriesPerType);
+    MPI_Allgather(&localEntries[0], numTypes * entriesPerType, MPI_UNSIGNED, &exchangedEntries[0], numTypes * entriesPerType, MPI_UNSIGNED, MPI_COMM_WORLD);
+
+    for (int i = 0; i < numTypes; i++) {
+        int processesReporting = 0;
+        unsigned int firstReportedId = 0;
+        bool idsMatch = true;
+
+        for (int rank = 0; rank < worldSize; rank++) {
+            const unsigned int *remoteEntry = &exchangedEntries[(rank * numTypes + i) * entriesPerType];
+            if (remoteEntry[0] == 0) {
+                continue;
+            }
+            if (processesReporting == 0) {
+                firstReportedId = remoteEntry[1];
+            }
+            processesReporting++;
+            idsMatch = idsMatch && (remoteEntry[1] == firstReportedId);
+        }
+
+        if (processesReporting == 0) {
+            // Nobody reports this clique type, so there's nothing to conclude from it.
+            // This is the case for logical endpoint cliques on the NVML fallback path.
+            cliqueSharingMap[ALL_CLIQUE_TYPES[i]] = CLIQUE_SHARING_UNKNOWN;
+        } else if (processesReporting == worldSize && idsMatch) {
+            cliqueSharingMap[ALL_CLIQUE_TYPES[i]] = CLIQUE_SHARING_SHARED;
+        } else {
+            cliqueSharingMap[ALL_CLIQUE_TYPES[i]] = CLIQUE_SHARING_SPLIT;
+        }
+    }
+}
+
+#endif
+
+static int checkCliques() {
+    nvmlGpuFabricInfoV_t fabricInfo = getGpuFabricInfo(NvLoom::getLocalDevice());
 
     // allowing running without MNNVL for development purposes
     if (fabricInfo.state == NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {
         OUTPUT << "WARNING: MNNVL fabric not available. Only single node operation available." << std::endl;
     }
-
-    auto cliqueIdArray = std::vector<unsigned int>(MPIWrapper::getWorldSize());
-    MPI_Allgather(&fabricInfo.cliqueId, 1, MPI_UNSIGNED, &cliqueIdArray[0], 1, MPI_UNSIGNED, MPI_COMM_WORLD);
 
     auto clusterUuidArray = std::string(MPIWrapper::getWorldSize() * NVML_GPU_FABRIC_UUID_LEN, 0);
     MPI_Allgather(&fabricInfo.clusterUuid, NVML_GPU_FABRIC_UUID_LEN, MPI_UNSIGNED_CHAR, &clusterUuidArray[0], NVML_GPU_FABRIC_UUID_LEN, MPI_UNSIGNED_CHAR, MPI_COMM_WORLD);
@@ -561,12 +744,36 @@ static int checkCliques() {
                 " is different than process " << i << " clusterUuid=" << ((unsigned long *)&clusterUuidArray[i * NVML_GPU_FABRIC_UUID_LEN])[0] << ";" <<  ((unsigned long *)&clusterUuidArray[i * NVML_GPU_FABRIC_UUID_LEN])[1] << std::endl;
             ASSERT(0);
         }
+    }
 
+#if CUDA_VERSION >= 13040
+    // Every copy method needs plain unicast pointers, so a world split across unicast pointer
+    // cliques has nothing left to benchmark. Clique types nobody reports aren't split, which
+    // keeps non-MNNVL systems running.
+    if (NvLoom::isCliqueSplit(CU_CLIQUE_TYPE_UNICAST_POINTER)) {
+        unsigned int cliqueId;
+        bool reportedLocally = NvLoom::getLocalCliqueId(CU_CLIQUE_TYPE_UNICAST_POINTER, cliqueId);
+        std::cerr << "Process " << MPIWrapper::getWorldRank();
+        if (reportedLocally) {
+            std::cerr << " belongs to " << getCliqueTypeName(CU_CLIQUE_TYPE_UNICAST_POINTER) << " clique " << cliqueId
+                      << ", while other processes belong to different ones";
+        } else {
+            std::cerr << " reports no " << getCliqueTypeName(CU_CLIQUE_TYPE_UNICAST_POINTER) << " clique, while other processes do";
+        }
+        std::cerr << std::endl;
+        ASSERT(0);
+    }
+#else
+    auto cliqueIdArray = std::vector<unsigned int>(MPIWrapper::getWorldSize());
+    MPI_Allgather(&fabricInfo.cliqueId, 1, MPI_UNSIGNED, &cliqueIdArray[0], 1, MPI_UNSIGNED, MPI_COMM_WORLD);
+
+    for (int i = 0; i < MPIWrapper::getWorldSize(); i++) {
         if (cliqueIdArray[i] != fabricInfo.cliqueId) {
             std::cerr << "Process " << MPIWrapper::getWorldRank() << " cliqueId=" << fabricInfo.cliqueId << " is different than process " << i << " cliqueId=" << cliqueIdArray[i] << std::endl;
             ASSERT(0);
         }
     }
+#endif
 
     return 0;
 }
@@ -656,6 +863,10 @@ void NvLoom::initialize(int _localDevice, std::map<std::string, std::vector<int>
 
     preloadKernels(localDevice);
     MPIWrapper::getWorldRank();
+#if CUDA_VERSION >= 13040
+    queryCliqueIds();
+    exchangeCliqueIds();
+#endif
     checkCliques();
     checkSystemConsistency();
 };
@@ -676,10 +887,19 @@ static int getMajorComputeCapability() {
     return major;
 }
 
+// Returns compute capability as major * 10 + minor, e.g. 107 for 10.7
+static int getComputeCapability() {
+    int minor;
+    CU_ASSERT(cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, NvLoom::getLocalDevice()));
+    return getMajorComputeCapability() * 10 + minor;
+}
+
 bool filterCopyType(CopyType copyType) {
     switch (copyType) {
         case COPY_TYPE_CE:
             return true;
+        case COPY_TYPE_LOCALIZED_CE:
+            return getComputeCapability() >= 107;
         case COPY_TYPE_SM:
             return true;
         // If we can allocate multicast buffers, we can run multicast copies
@@ -710,6 +930,18 @@ bool filterCopyType(CopyType copyType) {
     return false;
 }
 
+#if CUDA_VERSION >= 13040
+std::string getCliqueTypeName(CUcliqueType cliqueType) {
+    switch (cliqueType) {
+        case CU_CLIQUE_TYPE_UNICAST_POINTER: return "unicast pointer";
+        case CU_CLIQUE_TYPE_MULTICAST_POINTER: return "multicast pointer";
+        case CU_CLIQUE_TYPE_UNICAST_LOGICAL_ENDPOINT: return "unicast logical endpoint";
+        case CU_CLIQUE_TYPE_MULTICAST_LOGICAL_ENDPOINT: return "multicast logical endpoint";
+    }
+    throw std::runtime_error("Invalid clique type");
+}
+#endif
+
 std::string getCopyDirectionName(CopyDirection copyDirection) {
     if (copyDirection == COPY_DIRECTION_READ) return "read";
     if (copyDirection == COPY_DIRECTION_WRITE) return "write";
@@ -724,6 +956,7 @@ CopyDirection getCopyDirection(std::string name) {
 
 std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_CE) return "ce";
+    if (copyType == COPY_TYPE_LOCALIZED_CE) return "localized_ce";
     if (copyType == COPY_TYPE_SM) return "sm";
     if (copyType == COPY_TYPE_MULTICAST_WRITE) return "mc";
     if (copyType == COPY_TYPE_MULTICAST_LD_REDUCE) return "mc_ld_reduce";
@@ -733,17 +966,17 @@ std::string getCopyTypeName(CopyType copyType) {
     if (copyType == COPY_TYPE_TMA_MULTICAST_WRITE) return "tma_mc";
     if (copyType == COPY_TYPE_TMA_MULTICAST_RED_ALL) return "tma_mc_red_all";
     if (copyType == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) return "tma_mc_red_single";
-    // TODO: this needs to be updated for CSV testcases
     if (copyType == COPY_TYPE_CFT_READ) return "cft";
     if (copyType == COPY_TYPE_CFT_WRITE) return "cft";
     if (copyType == COPY_TYPE_CFT_WRITE_MULTICAST) return "cft_mc";
-    if ( copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) return "cft_mc_red";
+    if (copyType == COPY_TYPE_CFT_MULTICAST_RED_SINGLE || copyType == COPY_TYPE_CFT_MULTICAST_RED_ALL) return "cft_mc_red";
     if (copyType == COPY_TYPE_CFT_MULTICAST_PULLRED) return "cft_mc_pullred";
     throw std::runtime_error("Invalid copy type");
 }
 
 CopyType getCopyType(std::string name) {
     if (name == "ce") return COPY_TYPE_CE;
+    if (name == "localized_ce") return COPY_TYPE_LOCALIZED_CE;
     if (name == "sm") return COPY_TYPE_SM;
     if (name == "mc") return COPY_TYPE_MULTICAST_WRITE;
     if (name == "mc_ld_reduce") return COPY_TYPE_MULTICAST_LD_REDUCE;
@@ -755,6 +988,7 @@ CopyType getCopyType(std::string name) {
     if (name == "tma_mc_red_single") return COPY_TYPE_TMA_MULTICAST_RED_SINGLE;
     if (name == "cft_read") return COPY_TYPE_CFT_READ;
     if (name == "cft_write") return COPY_TYPE_CFT_WRITE;
+    if (name == "cft") return COPY_TYPE_CFT_READ;
     if (name == "cft_mc") return COPY_TYPE_CFT_WRITE_MULTICAST;
     if (name == "cft_mc_red_single") return COPY_TYPE_CFT_MULTICAST_RED_SINGLE;
     if (name == "cft_mc_red_all") return COPY_TYPE_CFT_MULTICAST_RED_ALL;

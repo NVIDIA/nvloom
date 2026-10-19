@@ -32,18 +32,35 @@
 #include <utility>
 #include <vector>
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::run(size_t copySize) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::run(size_t copySize) {
     CopyDescriptionMap copyDescriptionMap = parseCSV(csvInputFile);
 
     for (auto& benchmarkStep : copyDescriptionMap) {
         clearAllocationPools();
 
         auto& copyDescriptionVector = benchmarkStep.second;
+
+        // All copies in a measurement run simultaneously, so waive the whole measurement
+        // if any of its copy or memory types is unsupported on any process
+        int supported = 1;
+        for (const auto& copyDescription: copyDescriptionVector) {
+            if (!filterCopy<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(copyDescription)) {
+                supported = 0;
+            }
+        }
+        MPI_Allreduce(MPI_IN_PLACE, &supported, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+        if (!supported) {
+            for (auto& copyDescription: copyDescriptionVector) {
+                copyDescription.waived = true;
+            }
+            continue;
+        }
+
         std::vector<Copy> copies;
 
         for (const auto& copyDescription: copyDescriptionVector) {
-            copies.push_back(getCopy<unicastAllocator, egmAllocator, multicastAllocator>(copyDescription));
+            copies.push_back(getCopy<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(copyDescription));
         }
 
         auto benchmarkResults = NvLoom::doBenchmark(copies);
@@ -56,8 +73,8 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::run(size_t
     outputResults(copyDescriptionMap);
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::outputResults(const CopyDescriptionMap& copyDescriptionMap) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::outputResults(const CopyDescriptionMap& copyDescriptionMap) {
     std::string csvOutputString = getCSVOutputString(copyDescriptionMap);
 
     OUTPUT << csvOutputString << std::endl;
@@ -67,18 +84,18 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::outputResu
     }
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getName() {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::getName() {
     return "csv_pattern";
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-bool csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::filter() {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+bool csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::filter() {
     return !csvInputFile.empty();
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::validateGpuId(int gpuId) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::validateGpuId(int gpuId) {
     if (gpuId < 0) {
         throw std::runtime_error("GPU ID can't be negative: " + std::to_string(gpuId));
     }
@@ -87,8 +104,8 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::validateGp
     }
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getWord(std::istringstream& ss) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::getWord(std::istringstream& ss) {
     std::string word;
     std::getline(ss, word, ',');
     word = trimWhitespace(word);
@@ -96,8 +113,8 @@ std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::get
     return word;
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-int csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getInt(std::string str, std::string field) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+int csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::getInt(std::string str, std::string field) {
     try {
         return std::stoi(str);
     } catch (const std::invalid_argument& e) {
@@ -105,8 +122,8 @@ int csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getInt(std:
     }
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::parseCSVLine(const std::string& line) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::parseCSVLine(const std::string& line) {
     std::istringstream ss(line);
 
     // Parse line as "measurement_id, bandwidth/latency, gpu_src_id, gpu_dst_id, iteration_count, mem_src_type, mem_dst_type, write/read, ce/sm/multicast, buffer_size, comment, result [GB/s] [ns]"
@@ -128,6 +145,10 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
     size_t buffersz;
     size_t iterationCount;
 
+    measurementId = getInt(measurementIdStr, "measurement ID");
+    gpuSrc = getInt(gpuSrcStr, "GPU source ID");
+    gpuDst = getInt(gpuDstStr, "GPU destination ID");
+
     CopyType type;
     if (bandwidthLatencyStr == "latency") {
         type = COPY_TYPE_LATENCY;
@@ -141,22 +162,69 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
         type == COPY_TYPE_MULTICAST_RED_SINGLE ||
         type == COPY_TYPE_MULTICAST_LD_REDUCE ||
         type == COPY_TYPE_TMA_MULTICAST_RED_ALL ||
-        type == COPY_TYPE_TMA_MULTICAST_RED_SINGLE) {
-        throw std::runtime_error("Multicast reductions are not supported for CSV input testcase");
-    }
-
-    if (type == COPY_TYPE_CFT_READ ||
-        type == COPY_TYPE_CFT_WRITE ||
-        type == COPY_TYPE_CFT_WRITE_MULTICAST ||
+        type == COPY_TYPE_TMA_MULTICAST_RED_SINGLE ||
         type == COPY_TYPE_CFT_MULTICAST_RED_SINGLE ||
         type == COPY_TYPE_CFT_MULTICAST_RED_ALL ||
         type == COPY_TYPE_CFT_MULTICAST_PULLRED) {
-        throw std::runtime_error("CFT copy types are not supported for CSV input testcase: " + ceSmMulticastStr);
+        throw std::runtime_error("Multicast reductions are not supported for CSV input testcase");
     }
 
-    measurementId = getInt(measurementIdStr, "measurement ID");
-    gpuSrc = getInt(gpuSrcStr, "GPU source ID");
-    gpuDst = getInt(gpuDstStr, "GPU destination ID");
+    CopyDirection direction;
+    if (type == COPY_TYPE_LATENCY) {
+        // ignoring direction for latency testcase
+        direction = COPY_DIRECTION_WRITE;
+    } else {
+        direction = getCopyDirection(writeReadStr);
+    }
+
+    if (type == COPY_TYPE_CFT_READ || type == COPY_TYPE_CFT_WRITE) {
+        // CFT copy types have different methods for read and write, so we need to override the type based on the direction
+        if (direction == COPY_DIRECTION_WRITE) {
+            type = COPY_TYPE_CFT_WRITE;
+        } else if (direction == COPY_DIRECTION_READ) {
+            type = COPY_TYPE_CFT_READ;
+        } else {
+            throw std::runtime_error("Invalid direction for CFT copy type: " + writeReadStr);
+        }
+
+        if (gpuSrc == gpuDst) {
+            throw std::runtime_error("CFT copy types are not supported for self-copy");
+        }
+
+        // Override the memory type to cft for CFT copy types
+        // CFT memory reports its name as "device", so we need to override it to "cft"
+        if (memSrcStr == "device") {
+            memSrcStr = "cft";
+        }
+        if (memDstStr == "device") {
+            memDstStr = "cft";
+        }
+    }
+
+    if (type == COPY_TYPE_CFT_WRITE_MULTICAST) {
+        if (direction != COPY_DIRECTION_WRITE) {
+            throw std::runtime_error("cft_mc copy type requires write direction");
+        }
+
+        if (memDstStr != "multicast" && memDstStr != "cft_multicast") {
+            throw std::runtime_error("cft_mc copy type requires multicast destination memory");
+        }
+
+        // CFT multicast benchmarking requires CFT multicast allocations
+        if (memDstStr == "multicast") {
+            memDstStr = "cft_multicast";
+        }
+    }
+
+    if (type == COPY_TYPE_LOCALIZED_CE) {
+        // Localized CE reports its name as "device", so we need to override it to "localized"
+        if (memSrcStr == "device") {
+            memSrcStr = "localized";
+        }
+        if (memDstStr == "device") {
+            memDstStr = "localized";
+        }
+    }
 
     if (bufferszStr == "default") {
         buffersz = 1024 * 1024 * NvLoom::getDefaultBufferSizeInMiB(); // default is in MiB
@@ -202,19 +270,11 @@ std::pair<int, CopyDescription> csv_pattern<unicastAllocator, egmAllocator, mult
     AllocationDescription src(memSrcStr, gpuSrc, buffersz);
     AllocationDescription dst(memDstStr, gpuDst, buffersz);
 
-    CopyDirection direction;
-    if (type == COPY_TYPE_LATENCY) {
-        // ignoring direction for latency testcase
-        direction = COPY_DIRECTION_WRITE;
-    } else {
-        direction = getCopyDirection(writeReadStr);
-    }
-
     return std::make_pair(measurementId, CopyDescription(src, dst, iterationCount, direction, type, commentStr));
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-CopyDescriptionMap csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::parseCSV(const std::string& filePath) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+CopyDescriptionMap csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::parseCSV(const std::string& filePath) {
     std::string line;
     std::ifstream file(filePath);
     if (!file.is_open()) {
@@ -239,8 +299,8 @@ CopyDescriptionMap csv_pattern<unicastAllocator, egmAllocator, multicastAllocato
     return copyDescriptionMap;
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::getCSVOutputString(const CopyDescriptionMap& copyDescriptionMap) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::getCSVOutputString(const CopyDescriptionMap& copyDescriptionMap) {
     std::stringstream ss;
     ss << csvHeader << std::endl;
 
@@ -263,7 +323,11 @@ std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::get
                 ss << stepResults[i].src.bufferSize << ", ";
             }
             ss << stepResults[i].comment << ", ";
-            ss << stepResults[i].result;
+            if (stepResults[i].waived) {
+                ss << "WAIVED";
+            } else {
+                ss << stepResults[i].result;
+            }
             ss << std::endl;
         }
     }
@@ -272,8 +336,8 @@ std::string csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::get
 }
 
 // write CSV output file -> can be the same as input
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
-void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::writeCsvToFile(const std::string& csvOutputFile, const std::string& csvOutput) {
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>::writeCsvToFile(const std::string& csvOutputFile, const std::string& csvOutput) {
     if (MPIWrapper::getWorldRank() != 0) {
         return;
     }
@@ -286,6 +350,6 @@ void csv_pattern<unicastAllocator, egmAllocator, multicastAllocator>::writeCsvTo
     csv_o_file << csvOutput;
 }
 
-template class csv_pattern<MultinodeMemoryAllocationUnicast, MultinodeMemoryAllocationEGM, MultinodeMemoryAllocationMulticast>;
-template class csv_pattern<AllocationPool<MultinodeMemoryAllocationUnicast>, AllocationPool<MultinodeMemoryAllocationEGM>, MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>>;
-template class csv_pattern<MultinodeMemoryPoolAllocationUnicast, MultinodeMemoryPoolAllocationEGM, MultinodeMemoryAllocationMulticastCudaPool>;
+template class csv_pattern<MultinodeMemoryAllocationUnicast, MultinodeMemoryAllocationEGM, MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationUnicastCFT, MultinodeMemoryAllocationMulticastCFT, LocalizedMultinodeMemoryAllocationUnicast>;
+template class csv_pattern<AllocationPool<MultinodeMemoryAllocationUnicast>, AllocationPool<MultinodeMemoryAllocationEGM>, MulticastPool<MultinodeMemoryAllocationMulticast, MultinodeMemoryAllocationMulticastRef>, AllocationPool<MultinodeMemoryAllocationUnicastCFT>, MulticastPool<MultinodeMemoryAllocationMulticastCFT, MultinodeMemoryAllocationMulticastCFTRef>, AllocationPool<LocalizedMultinodeMemoryAllocationUnicast>>;
+template class csv_pattern<MultinodeMemoryPoolAllocationUnicast, MultinodeMemoryPoolAllocationEGM, MultinodeMemoryAllocationMulticastCudaPool, MultinodeMemoryAllocationUnicastCFT, MultinodeMemoryAllocationMulticastCFT, LocalizedMultinodeMemoryAllocationUnicast>;

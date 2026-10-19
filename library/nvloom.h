@@ -170,6 +170,15 @@ public:
     std::vector<double> calculateBandwidths();
 };
 
+#if CUDA_VERSION >= 13040
+constexpr CUcliqueType ALL_CLIQUE_TYPES[] = {
+    CU_CLIQUE_TYPE_UNICAST_POINTER,
+    CU_CLIQUE_TYPE_MULTICAST_POINTER,
+    CU_CLIQUE_TYPE_UNICAST_LOGICAL_ENDPOINT,
+    CU_CLIQUE_TYPE_MULTICAST_LOGICAL_ENDPOINT,
+};
+#endif
+
 class NvLoom {
 private:
     static inline int localDevice;
@@ -181,13 +190,23 @@ private:
     static inline std::string localHostname;
     static inline std::map<std::string, std::vector<int> > rackToProcessMap;
     static inline std::vector<int> localSMIds;
+
+#if CUDA_VERSION >= 13040
+    // Fabric clique IDs of the local device, indexed by clique type
+    static inline std::map<CUcliqueType, unsigned int> localCliqueIds;
+    // Per clique type, whether every process in the MPI world is part of the same clique
+    static inline std::map<CUcliqueType, CliqueSharing> cliqueSharing;
+#endif
+
     static inline bool spinKernelsEnabled = true;
     static inline int copyKernelBlockCountOverride = 0;
     static inline int tmaChunkSize = DEFAULT_TMA_CHUNK_SIZE_KB * 1024;
+    static inline FillPattern fillPattern = FILL_PATTERN_PSEUDORANDOM;
     static inline std::vector<Copy> currentCopies;
     static inline std::map<int, std::string> processNameMap;
 public:
     static std::vector<double> doBenchmark(std::vector<Copy> copies);
+    static std::vector<double> doBenchmarkCore(std::vector<Copy> copies);
 
     static int getLocalDevice() { return localDevice; };
     static CUdevice getLocalCuDevice() { return localCuDevice; };
@@ -197,9 +216,31 @@ public:
     // but can be overridden via setCopyKernelBlockCountOverride().
     static int getCopyKernelBlockCount() { return copyKernelBlockCountOverride > 0 ? copyKernelBlockCountOverride : std::min(localMultiprocessorCount, 128); };
     static int getTmaChunkSize() { return tmaChunkSize; };
+    static FillPattern getFillPattern() { return fillPattern; };
     static int getLocalClockRate() { return localClockRate; };
     static int getLocalCpuNumaNode() { return localCpuNumaNode; };
     static std::vector<int>& getLocalSMIds() { return localSMIds; };
+
+#if CUDA_VERSION >= 13040
+    static std::map<CUcliqueType, unsigned int>& getLocalCliqueIds() { return localCliqueIds; };
+    static std::map<CUcliqueType, CliqueSharing>& getCliqueSharingMap() { return cliqueSharing; };
+    static CliqueSharing getCliqueSharing(CUcliqueType cliqueType) {
+        auto it = cliqueSharing.find(cliqueType);
+        return it == cliqueSharing.end() ? CLIQUE_SHARING_UNKNOWN : it->second;
+    };
+    // True when the processes aren't all part of the same clique of the given type, which makes
+    // copy methods relying on that clique type unrunnable. Unknown clique types don't count as
+    // split, so nothing is waived when no clique information is reported at all.
+    static bool isCliqueSplit(CUcliqueType cliqueType) { return getCliqueSharing(cliqueType) == CLIQUE_SHARING_SPLIT; };
+    // Returns false when the local device isn't part of a clique of the given type
+    static bool getLocalCliqueId(CUcliqueType cliqueType, unsigned int &cliqueId) {
+        auto it = localCliqueIds.find(cliqueType);
+        if (it == localCliqueIds.end()) return false;
+        cliqueId = it->second;
+        return true;
+    };
+#endif
+
     static std::string getLocalHostname() { return localHostname; };
     static unsigned long long getDefaultIterationCount() { return DEFAULT_ITERATIONS; };
     static unsigned long long getDefaultLatencyIterationCount() { return DEFAULT_LATENCY_ITERATIONS; };
@@ -214,6 +255,7 @@ public:
     // Override the number of thread blocks launched by copy kernels. A value <= 0 restores the default.
     static void setCopyKernelBlockCountOverride(int count) { copyKernelBlockCountOverride = count; }
     static void setTmaChunkSize(int chunkSize) { tmaChunkSize = chunkSize; };
+    static void setFillPattern(FillPattern _fillPattern) { fillPattern = _fillPattern; };
     static void finalize();
     static bool executingCopies();
     static void setCurrentCopies(std::vector<Copy> _copies) { currentCopies = _copies; };
@@ -227,6 +269,10 @@ std::string getRackGuid(int device);
 std::string trimRackGuid(std::string rackGuid);
 
 bool filterCopyType(CopyType copyType);
+
+#if CUDA_VERSION >= 13040
+std::string getCliqueTypeName(CUcliqueType cliqueType);
+#endif
 
 std::string getCopyDirectionName(CopyDirection copyDirection);
 CopyDirection getCopyDirection(std::string name);

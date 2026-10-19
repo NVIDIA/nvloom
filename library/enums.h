@@ -24,6 +24,7 @@ enum CopyDirection {
 
 enum CopyType {
     COPY_TYPE_CE = 0,
+    COPY_TYPE_LOCALIZED_CE,
     COPY_TYPE_SM,
     COPY_TYPE_MULTICAST_WRITE,
     COPY_TYPE_MULTICAST_LD_REDUCE,
@@ -48,6 +49,20 @@ enum CopyType {
 enum MemoryPurpose {
     MEMORY_SOURCE = 0,
     MEMORY_DESTINATION,
+};
+
+enum FillPattern {
+    FILL_PATTERN_PSEUDORANDOM = 0,
+    FILL_PATTERN_ONES,
+    FILL_PATTERN_ALLOCATION_ID,
+};
+
+// Whether all processes in the MPI world share a given fabric clique.
+// UNKNOWN means no process reported the clique type, so nothing can be concluded.
+enum CliqueSharing {
+    CLIQUE_SHARING_UNKNOWN = 0,
+    CLIQUE_SHARING_SHARED,
+    CLIQUE_SHARING_SPLIT,
 };
 
 enum IsRandom {

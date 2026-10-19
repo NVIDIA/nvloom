@@ -26,7 +26,7 @@
 #include <memory>
 #include <random>
 
-#define NVLOOM_VERSION "2.1.0"
+#define NVLOOM_VERSION "2.2.0"
 #ifndef GIT_COMMIT
 #define GIT_COMMIT "unknown"
 #endif
@@ -40,6 +40,7 @@ int latencyIterations = NvLoom::getDefaultLatencyIterationCount();
 bool enableProfiling = false;
 char bandwidthUnit = 'G';
 unsigned int seed = 0; // This value is always overwritten via randomness or CLI arg.
+std::string jsonOutputFile = "";
 
 bool shouldContinue(boost::program_options::variables_map &vm, int iteration, std::chrono::time_point<std::chrono::high_resolution_clock> startTime) {
     if (vm["repeat"].defaulted() && vm["duration"].defaulted()) {
@@ -72,6 +73,17 @@ AllocatorStrategy getAllocatorStrategy(std::string allocatorStrategyString) {
     throw std::runtime_error("Unknown allocator strategy: " + allocatorStrategyString);
 }
 
+FillPattern getFillPattern(std::string fillPatternString) {
+    if (fillPatternString == "pseudorandom") {
+        return FILL_PATTERN_PSEUDORANDOM;
+    } else if (fillPatternString == "ones") {
+        return FILL_PATTERN_ONES;
+    } else if (fillPatternString == "allocationId") {
+        return FILL_PATTERN_ALLOCATION_ID;
+    }
+    throw std::runtime_error("Unknown fill pattern: " + fillPatternString);
+}
+
 char getBandwidthUnit(char bandwidthUnitChar) {
     char originalBandwidthUnitChar = bandwidthUnitChar;
     bandwidthUnitChar = std::tolower(bandwidthUnitChar);
@@ -86,6 +98,8 @@ int run_program(int argc, char **argv) {
     std::vector<std::string> testcasesToRun;
     std::vector<std::string> suitesToRun;
     std::string allocatorStrategyString;
+    std::string fillPatternString;
+    FillPattern fillPattern;
     std::string bufferSizeStr = std::to_string(NvLoom::getDefaultBufferSizeInMiB()) + "M";
     std::string tmaChunkSizeStr = std::to_string(NvLoom::getDefaultTMAChunkSizeInKB()) + "K";
     size_t bufferSizeInBytes;
@@ -95,7 +109,15 @@ int run_program(int argc, char **argv) {
     int blockCount = 0;
     AllocatorStrategy allocatorStrategy;
 
-    std::string suitesOptionDescription("Suite(s) to run (by name): all-to-one, rack-aware-all-to-one, egm, egm-gpu-to-rack, fabric-stress, gpu-to-rack, multicast, pairwise, rack-to-rack, latency, csv, pairwise-tma, multicast-tma, pairwise-cft, multicast-cft");
+    std::string suitesOptionDescription("Suite(s) to run (by name): ");
+    std::vector<std::string> suiteNames = getSuiteNames();
+    for (size_t i = 0; i < suiteNames.size(); i++) {
+        if (i > 0) {
+            suitesOptionDescription += ", ";
+        }
+        suitesOptionDescription += suiteNames[i];
+    }
+
     opts.add_options()
         ("help,h", "Produce help message")
         ("bufferSize,b", boost::program_options::value<std::string>(&bufferSizeStr)->default_value(bufferSizeStr), "Buffer size in bytes. Also accepts k, m, g, t suffixes for kibibytes, mebibytes, gibibytes and tebibytes respectively. Letter case is ignored. Byte count must be divisible by 128 bytes.")
@@ -116,6 +138,8 @@ int run_program(int argc, char **argv) {
         ("tmaChunkSize", boost::program_options::value<std::string>(&tmaChunkSizeStr)->default_value(tmaChunkSizeStr), (std::string("Override the chunk size for TMA copies (maximum ") + std::to_string(MAX_SMEM_CAPACITY_SIZE / 1024) + "KB). If the value is not a multiple of 16B, its closest multiple of 16B will be used. You may pass in a plain integer (bytes), or append b/B for bytes and k/K for kibibytes.").c_str())
         ("bandwidthUnit", boost::program_options::value<char>(&bandwidthUnit)->default_value(bandwidthUnit), "Unit of reported bandwidths. Acceptable values are K, M, G, T for KB/s, MB/s, GB/s and TB/s respectively. Letter case is ignored.")
         ("seed", boost::program_options::value<unsigned int>(&seed)->default_value(seed), "Seed for random number generator. The value must be unsigned. If not specified, the default value is randomly decided.")
+        ("fillPattern", boost::program_options::value<std::string>(&fillPatternString)->default_value("pseudorandom"), "Pattern used to fill and verify benchmark buffers: pseudorandom (a distinct value per 4-byte word), ones (every word set to 0x1) or allocationId (every word set to the id of the allocation)")
+        ("jsonOutputFile", boost::program_options::value<std::string>(&jsonOutputFile)->default_value(jsonOutputFile), "JSON output file. If specified, results will be also saved in JSON format to the specified file. Experimental feature, subject to change.")
         ;
 
     boost::program_options::variables_map vm;
@@ -128,6 +152,7 @@ int run_program(int argc, char **argv) {
             throw std::runtime_error("Buffer size must be a positive integer and divisible by 128 bytes");
         }
         allocatorStrategy = getAllocatorStrategy(allocatorStrategyString);
+        fillPattern = getFillPattern(fillPatternString);
 
         if (latencyIterations < 1024) {
             throw std::runtime_error("Latency iterations must be at least 1024");
@@ -171,6 +196,8 @@ int run_program(int argc, char **argv) {
             NvLoom::setTmaChunkSize(tmaChunkSize);
         }
 
+        NvLoom::setFillPattern(fillPattern);
+
         if (vm["seed"].defaulted()) {
             std::random_device random_dev;
             seed = random_dev();
@@ -192,6 +219,10 @@ int run_program(int argc, char **argv) {
         return 0;
     }
 
+    if (vm.count("jsonOutputFile")) {
+        OutputMatrix::setJsonOutputFile(jsonOutputFile);
+    }
+
     OUTPUT << "nvloom_cli " << NVLOOM_VERSION << std::endl;
     OUTPUT << "git commit: " << GIT_COMMIT << std::endl;
     OUTPUT << "NVCC version: " << getNvccVersion() << std::endl;
@@ -202,6 +233,7 @@ int run_program(int argc, char **argv) {
     OUTPUT << "Iteration count: " << iterations << std::endl;
     OUTPUT << "Seed: " << seed << std::endl;
     OUTPUT << "TMA chunk size: " << NvLoom::getTmaChunkSize() << std::endl;
+    OUTPUT << "Fill pattern: " << fillPatternString << std::endl;
 
     auto [testcases, suites] = buildTestcases(allocatorStrategy);
 
@@ -216,6 +248,33 @@ int run_program(int argc, char **argv) {
     std::map<std::string, std::vector<int> > rackToProcessMap;
     int localDevice = discoverRanks(rackToProcessMap);
     NvLoom::initialize(localDevice, rackToProcessMap);
+
+#if CUDA_VERSION >= 13040
+    OUTPUT << "Fabric cliques:" << std::endl;
+    for (auto cliqueType : ALL_CLIQUE_TYPES) {
+        unsigned int cliqueId;
+        OUTPUT << "  " << getCliqueTypeName(cliqueType) << ": ";
+        if (NvLoom::getLocalCliqueId(cliqueType, cliqueId)) {
+            OUTPUT << "id " << cliqueId;
+        } else {
+            OUTPUT << "not reported";
+        }
+
+        switch (NvLoom::getCliqueSharing(cliqueType)) {
+            case CLIQUE_SHARING_SHARED: OUTPUT << " (all processes in the same clique)" << std::endl; break;
+            case CLIQUE_SHARING_SPLIT: OUTPUT << " (processes in different cliques)" << std::endl; break;
+            case CLIQUE_SHARING_UNKNOWN: OUTPUT << " (no process reports this clique type)" << std::endl; break;
+        }
+    }
+
+    for (auto cliqueType : ALL_CLIQUE_TYPES) {
+        if (NvLoom::isCliqueSplit(cliqueType)) {
+            OUTPUT << "WARNING: processes belong to different " << getCliqueTypeName(cliqueType)
+                   << " cliques. Copies relying on this clique type will be waived." << std::endl;
+        }
+    }
+#endif
+
     if (enableProfiling) {
         NvLoom::disableSpinKernels();
     }
@@ -298,6 +357,7 @@ int main(int argc, char **argv) {
     std::cout << std::unitbuf;
     int ret = run_program(argc, argv);
 
+    OutputMatrix::finalize();
     NvLoom::finalize();
     return ret;
 }

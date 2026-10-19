@@ -19,7 +19,7 @@
 #define TESTCASES_H_
 #include <memory>
 #include <map>
-#include <random> 
+#include <random>
 
 extern bool richOutput;
 extern int gpuToRackSamples;
@@ -27,7 +27,7 @@ extern std::string csvInputFile;
 extern std::string csvOutputFile;
 extern int iterations;
 extern int latencyIterations;
-extern std::mt19937 rng; 
+extern std::mt19937 rng;
 
 enum CopyCount {
     COPY_COUNT_UNIDIR = 0,
@@ -71,5 +71,9 @@ public:
 };
 
 std::tuple<std::map<std::string, std::unique_ptr<Testcase> >, std::map<std::string, std::vector<std::string> > > buildTestcases(AllocatorStrategy strategy);
+
+// Returns the names of all available suites, sorted. The set of suites does not
+// depend on the allocator strategy, so no strategy needs to be provided.
+std::vector<std::string> getSuiteNames();
 
 #endif  // UTIL_H_

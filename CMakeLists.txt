@@ -54,10 +54,10 @@ add_executable(nvloom_cli ${src})
 target_include_directories(nvloom_cli PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES} ${CMAKE_CURRENT_SOURCE_DIR}/library .)
 target_link_libraries(nvloom_cli cuda nvidia-ml Boost::program_options)
 
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
-    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100;103")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "13.4")
+    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100;103;107")
 else()
-    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100")
+    set_target_properties(nvloom_cli PROPERTIES CUDA_ARCHITECTURES "86;90;100;103")
 endif()
 
 find_package(MPI REQUIRED)

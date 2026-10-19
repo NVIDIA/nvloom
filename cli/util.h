@@ -25,6 +25,7 @@
 #include <string>
 #include <cctype>
 #include <stdexcept>
+#include <fstream>
 
 extern char bandwidthUnit;
 
@@ -42,6 +43,15 @@ public:
         BANDWIDTH,
         LATENCY,
     };
+
+    class StatisticsStrings {
+    public:
+        std::string min;
+        std::string max;
+        std::string avg;
+        std::string med;
+        std::string total;
+    };
 private:
     std::string name;
     int dimX;
@@ -57,6 +67,9 @@ private:
     MeasurementType measurementType;
     std::string unit;
     double unitMultiplier;
+    static inline std::string jsonOutputFile;
+    static inline std::ofstream jsonFile;
+    static inline int jsonTestCount = 0;
 
     void fillLabels(std::vector<std::string>& vec, int size) {
         for (int i = 0; i < size; i++) {
@@ -66,6 +79,44 @@ private:
 
     void incrementalPrint(int stage);
 
+    void printJson(StatisticsStrings stats);
+
+    std::string getStatisticsString(double value) {
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(2) << value;
+        return ss.str();
+    }
+
+    StatisticsStrings getStatisticsStrings() {
+        StatisticsStrings stats;
+        stats.min = "N/A";
+        stats.max = "N/A";
+        stats.avg = "N/A";
+        stats.med = "N/A";
+        stats.total = "N/A";
+
+        std::vector<double> filteredData;
+        // C++20 has "erase", which does exactly what we want
+        // We're on C++17, so let's do it manually
+        for (auto elem : data) {
+            if (elem != 0) {
+                filteredData.push_back(elem);
+            }
+        }
+
+        if (filteredData.size() > 0) {
+            auto sum = std::reduce(filteredData.begin(), filteredData.end());
+            std::sort(filteredData.begin(), filteredData.end());
+            size_t n = filteredData.size();
+            double median = (n % 2 == 0) ? (filteredData[n/2 - 1] + filteredData[n/2]) / 2.0 : filteredData[n/2];
+            stats.min = getStatisticsString(filteredData.front());
+            stats.max = getStatisticsString(filteredData.back());
+            stats.avg = getStatisticsString(sum / n);
+            stats.med = getStatisticsString(median);
+            stats.total = getStatisticsString(sum);
+        }
+        return stats;
+    }
 public:
     OutputMatrix(std::string _name, int _dimX, int _dimY, Buffering _buffering = BUFFERING_ENABLED, MeasurementType _measurementType = MeasurementType::BANDWIDTH) : name(_name), dimX(_dimX), dimY(_dimY), data(dimX * dimY, 0), initialized(dimX * dimY, false), notes(dimX * dimY, ""), buffering(_buffering), measurementType(_measurementType) {
         fillLabels(labelsX, dimX);
@@ -100,37 +151,16 @@ public:
             incrementalPrint(i);
         }
 
-        std::vector<double> filteredData;
-        // C++20 has "erase", which does exactly what we want
-        // We're on C++17, so let's do it manually
-        for (auto elem : data) {
-            if (elem != 0) {
-                filteredData.push_back(elem);
-            }
-        }
+        auto stats = getStatisticsStrings();
+        OUTPUT << std::endl;
+        OUTPUT << "Min " << name << " " << stats.min << " " << unit << std::endl;
+        OUTPUT << "Avg " << name << " " << stats.avg << " " << unit << std::endl;
+        OUTPUT << "Med " << name << " " << stats.med << " " << unit << std::endl;
+        OUTPUT << "Max " << name << " " << stats.max << " " << unit << std::endl;
+        OUTPUT << "Total " << name << " " << stats.total << " " << unit << std::endl;
+        OUTPUT << std::endl;
 
-        if (filteredData.size() == 0) {
-            OUTPUT << std::endl;
-            OUTPUT << "Min " << name << " N/A " << unit << std::endl;
-            OUTPUT << "Avg " << name << " N/A " << unit << std::endl;
-            OUTPUT << "Med " << name << " N/A " << unit << std::endl;
-            OUTPUT << "Max " << name << " N/A " << unit << std::endl;
-            OUTPUT << "Total " << name << " N/A " << unit << std::endl;
-            OUTPUT << std::endl;
-        } else {
-            auto sum = std::reduce(filteredData.begin(), filteredData.end());
-            std::sort(filteredData.begin(), filteredData.end());
-            size_t n = filteredData.size();
-            double median = (n % 2 == 0) ? (filteredData[n/2 - 1] + filteredData[n/2]) / 2.0 : filteredData[n/2];
-            OUTPUT << std::endl;
-            OUTPUT << std::fixed << std::setprecision(2);
-            OUTPUT << "Min " << name << " " << filteredData.front() << " " << unit << std::endl;
-            OUTPUT << "Avg " << name << " " << sum / n << " " << unit << std::endl;
-            OUTPUT << "Med " << name << " " << median << " " << unit << std::endl;
-            OUTPUT << "Max " << name << " " << filteredData.back() << " " << unit << std::endl;
-            OUTPUT << "Total " << name << " " << sum << " " << unit << std::endl;
-            OUTPUT << std::endl;
-        }
+        printJson(stats);
     }
 
     void set(int x, int y, double value, std::string note = "") {
@@ -176,6 +206,9 @@ public:
     void setColumnSeparators(std::vector<int> _columnSeparators) {
         columnSeparators = _columnSeparators;
     }
+
+    static void setJsonOutputFile(std::string _jsonOutputFile);
+    static void finalize();
 };
 
 template <typename T, typename U>

@@ -1,5 +1,24 @@
 # Changelog
 
+## [2.2.0] - 2026-10-19
+
+### Added
+- Added localized CE benchmarks
+- Added CFT all-to-one/all-from-one tests
+- Added support for CFT and localized CE benchmarks to the CSV-defined benchmark
+- Added option to save benchmark results as JSON file. Experimental feature, subject to change.
+- Added --fillPattern option to control how buffers are memset prior to benchmarking
+- Added support for cuDeviceGetCliqueInfo to determine whether GPUs are in the same clique for a given operation
+- Added a warning if a GPU is trying to execute multiple CE methods or multiple non-CE methods at the same time
+
+### Changed
+- CFT handles are now pooled for each CFT testcase, rather than each allocation creating its own CFT handle
+- Overhauled the "fully random" fabric stress test to remove the limit of 3 peers
+- Sample Dockerfile is now based on CUDA 13.4.1
+
+### Fixed
+- Fixed a bug in "fully random" fabric stress test where the test would schedule multiple CE concurrent copies per GPU
+
 ## [2.1.0] - 2026-07-23
 
 ### Added

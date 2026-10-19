@@ -29,7 +29,7 @@ public:
     AllocationDescription(std::string type, int location, size_t bufferSize) : type(type), location(location), bufferSize(bufferSize) {}
 };
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
 std::shared_ptr<MemoryAllocation> getAllocation(AllocationDescription desc) {
     if (desc.type == "device") {
         return std::make_shared<unicastAllocator>(desc.bufferSize, desc.location);
@@ -37,6 +37,30 @@ std::shared_ptr<MemoryAllocation> getAllocation(AllocationDescription desc) {
         return std::make_shared<egmAllocator>(desc.bufferSize, desc.location);
     } else if (desc.type == "multicast") {
         return std::make_shared<multicastAllocator>(desc.bufferSize, desc.location);
+    } else if (desc.type == "cft") {
+        return std::make_shared<cftAllocator>(desc.bufferSize, desc.location);
+    } else if (desc.type == "cft_multicast") {
+        return std::make_shared<cftMulticastAllocator>(desc.bufferSize, desc.location);
+    } else if (desc.type == "localized") {
+        return std::make_shared<localizedAllocator>(desc.bufferSize, desc.location);
+    }
+    throw std::runtime_error("Invalid allocation type: " + desc.type);
+}
+
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+bool filterAllocation(const AllocationDescription& desc) {
+    if (desc.type == "device") {
+        return unicastAllocator::filter();
+    } else if (desc.type == "egm") {
+        return egmAllocator::filter();
+    } else if (desc.type == "multicast") {
+        return multicastAllocator::filter();
+    } else if (desc.type == "cft") {
+        return cftAllocator::filter();
+    } else if (desc.type == "cft_multicast") {
+        return cftMulticastAllocator::filter();
+    } else if (desc.type == "localized") {
+        return localizedAllocator::filter();
     }
     throw std::runtime_error("Invalid allocation type: " + desc.type);
 }
@@ -48,37 +72,53 @@ public:
     CopyDirection direction;
     CopyType type;
     double result;
+    bool waived = false;
     std::string comment;
     size_t iterationCount;
 
     CopyDescription(AllocationDescription src, AllocationDescription dst, size_t iterationCount, CopyDirection direction, CopyType type, std::string comment) : src(src), dst(dst), direction(direction), type(type), iterationCount(iterationCount), comment(comment) {}
 };
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
+bool filterCopy(const CopyDescription& desc) {
+    if (!filterCopyType(desc.type)) {
+        return false;
+    }
+    if (!filterAllocation<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(desc.src)) {
+        return false;
+    }
+    // Latency only uses the source memory type
+    if (desc.type == COPY_TYPE_LATENCY) {
+        return true;
+    }
+    return filterAllocation<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(desc.dst);
+}
+
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
 Copy getLatency(CopyDescription desc) {
     if (desc.src.type == "device") {
         return Latency<unicastAllocator>(desc.src.location, desc.dst.location, desc.iterationCount);
     } else if (desc.src.type == "egm") {
         return Latency<egmAllocator>(desc.src.location, desc.dst.location, desc.iterationCount);
     } else {
-        throw std::runtime_error("Invalid allocation type: " + desc.src.type);
+        throw std::runtime_error("Invalid allocation type for latency: " + desc.src.type);
     }
 }
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
 Copy getCopy(CopyDescription desc) {
     if (desc.type == COPY_TYPE_LATENCY) {
-        return getLatency<unicastAllocator, egmAllocator, multicastAllocator>(desc);
+        return getLatency<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(desc);
     } else {
-        std::shared_ptr<MemoryAllocation> srcAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator>(desc.src);
-        std::shared_ptr<MemoryAllocation> dstAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator>(desc.dst);
+        std::shared_ptr<MemoryAllocation> srcAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(desc.src);
+        std::shared_ptr<MemoryAllocation> dstAlloc = getAllocation<unicastAllocator, egmAllocator, multicastAllocator, cftAllocator, cftMulticastAllocator, localizedAllocator>(desc.dst);
         return Copy(dstAlloc, srcAlloc, desc.direction, desc.type, desc.iterationCount);
     }
 }
 
 typedef std::map<int, std::vector<CopyDescription>> CopyDescriptionMap;
 
-template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator>
+template <typename unicastAllocator, typename egmAllocator, typename multicastAllocator, typename cftAllocator, typename cftMulticastAllocator, typename localizedAllocator>
 class csv_pattern : public Testcase {
 private:
     std::string csvHeader = "measurement_id, bandwidth/latency, gpu_src_id, gpu_dst_id, iteration_count, mem_src_type, mem_dst_type, write/read, ce/sm/multicast, buffer_size, comment, result [GB/s] [ns]";

@@ -740,11 +740,24 @@ CUresult spinKernelMultistage(volatile int *latch1, volatile int *latch2, CUstre
     return CUDA_SUCCESS;
 }
 
-__global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int groupId, int groupSize) {
+__device__ __host__ inline uint getConstantFillValue(FillPattern fillPattern, int allocationId) {
+    return (fillPattern == FILL_PATTERN_ONES) ? 1u : (uint) allocationId;
+}
+
+__global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int groupId, int groupSize, FillPattern fillPattern) {
     unsigned long long threadId = blockDim.x * blockIdx.x + threadIdx.x;
     size_t totalThreadCount = gridDim.x * blockDim.x;
     char* dstEnd = ((char *) dst) + bufferSize;
     dst += threadId;
+
+    if (fillPattern != FILL_PATTERN_PSEUDORANDOM) {
+        uint value = getConstantFillValue(fillPattern, seed);
+        while ((char *) dst < dstEnd) {
+            *dst = value;
+            dst += totalThreadCount;
+        }
+        return;
+    }
 
     curandStateXORWOW_t state;
     curand_init(seed, 0, threadId, &state);
@@ -766,7 +779,7 @@ __global__ void patternFillKernel(uint* dst, int seed, size_t bufferSize, int gr
 void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, int groupId, int groupSize) {
     dim3 gridDim(fillCheckNumBlocks, 1, 1);
     dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
-    patternFillKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, groupId, groupSize);
+    patternFillKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, groupId, groupSize, NvLoom::getFillPattern());
     CUDA_ASSERT(cudaPeekAtLastError());
 }
 
@@ -796,7 +809,7 @@ void memsetBuffer(void *ptr, int seed, size_t size, CUstream stream, CopyType co
     }
 }
 
-__global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, unsigned long long *errorCount, int groupSize, int multiplier) {
+__global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, unsigned long long *errorCount, int groupSize, int multiplier, FillPattern fillPattern) {
     uint* originalBuffer = buffer;
     unsigned long long threadId = blockDim.x * blockIdx.x + threadIdx.x;
     size_t totalThreadCount = gridDim.x * blockDim.x;
@@ -804,14 +817,20 @@ __global__ void patternCheckKernel(uint* buffer, int seed, size_t bufferSize, un
     buffer += threadId;
 
     curandStateXORWOW_t state;
-    curand_init(seed, 0, threadId, &state);
+    if (fillPattern == FILL_PATTERN_PSEUDORANDOM) {
+        curand_init(seed, 0, threadId, &state);
+    }
 
     while ((char *) buffer < bufferEnd) {
         uint expectedValue = 0;
 
-        for (int i = 0; i < groupSize; i++) {
-            // overflow for uint is well defined
-            expectedValue += curand(&state);
+        if (fillPattern == FILL_PATTERN_PSEUDORANDOM) {
+            for (int i = 0; i < groupSize; i++) {
+                // overflow for uint is well defined
+                expectedValue += curand(&state);
+            }
+        } else {
+            expectedValue = getConstantFillValue(fillPattern, seed) * groupSize;
         }
 
         expectedValue *= multiplier;
@@ -839,7 +858,7 @@ unsigned long long checkBuffer(void *ptr, int seed, size_t size, CUstream stream
 
     dim3 gridDim(fillCheckNumBlocks, 1, 1);
     dim3 blockDim(defaultNumThreadPerBlock, 1, 1);
-    patternCheckKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount, groupSize, multiplier);
+    patternCheckKernel<<<gridDim, blockDim, 0, stream>>>((uint *)ptr, seed, size, errorCount, groupSize, multiplier, NvLoom::getFillPattern());
     CUDA_ASSERT(cudaPeekAtLastError());
     CU_ASSERT(cuStreamSynchronize(stream));
 
